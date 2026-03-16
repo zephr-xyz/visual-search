@@ -16,7 +16,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
     position: absolute; top: 12px; left: 12px; z-index: 10;
     background: white; border-radius: 8px; padding: 16px;
     box-shadow: 0 2px 12px rgba(0,0,0,0.15);
-    width: 340px; max-height: calc(100vh - 24px); overflow-y: auto;
+    width: 360px; max-height: calc(100vh - 24px); overflow-y: auto;
 }
 
 h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
@@ -47,6 +47,17 @@ h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
     font-size: 13px; background: white;
 }
 
+#breadcrumb {
+    display: none; margin-bottom: 10px; font-size: 13px;
+    background: #f7f7f7; border-radius: 4px; padding: 6px 10px;
+}
+#breadcrumb .crumb {
+    color: #4a90d9; cursor: pointer; text-decoration: underline;
+}
+#breadcrumb .crumb:hover { color: #2a5a99; }
+#breadcrumb .sep { color: #999; margin: 0 6px; }
+#breadcrumb .current { color: #333; font-weight: 600; }
+
 #status {
     font-size: 12px; color: #888; margin-bottom: 8px;
     min-height: 16px;
@@ -58,18 +69,45 @@ h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
 .result-row {
     display: flex; justify-content: space-between; align-items: center;
     padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px;
+    cursor: pointer;
 }
+.result-row:hover { background: #f8f8f8; }
 .result-row:last-child { border-bottom: none; }
-.result-name { color: #333; flex: 1; }
+.result-name { color: #333; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .result-bar {
     width: 80px; height: 14px; background: #f0f0f0; border-radius: 3px;
-    margin: 0 8px; overflow: hidden;
+    margin: 0 8px; overflow: hidden; flex-shrink: 0;
 }
 .result-bar-fill {
     height: 100%; background: #4a90d9; border-radius: 3px;
     transition: width 0.3s ease;
 }
-.result-pct { font-size: 12px; color: #666; width: 50px; text-align: right; }
+.result-pct { font-size: 12px; color: #666; width: 50px; text-align: right; flex-shrink: 0; }
+.result-count { font-size: 11px; color: #999; width: 50px; text-align: right; flex-shrink: 0; }
+
+/* Image results panel */
+#image-panel {
+    display: none; position: absolute; top: 12px; right: 12px; z-index: 10;
+    background: white; border-radius: 8px; padding: 16px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    width: 380px; max-height: calc(100vh - 24px); overflow-y: auto;
+}
+#image-panel h3 { font-size: 14px; margin-bottom: 8px; color: #333; }
+#image-panel .close-btn {
+    position: absolute; top: 10px; right: 14px;
+    cursor: pointer; font-size: 18px; color: #999;
+}
+#image-panel .close-btn:hover { color: #333; }
+.image-card {
+    border: 1px solid #eee; border-radius: 6px; padding: 10px;
+    margin-bottom: 8px; font-size: 12px;
+}
+.image-card .caption { color: #333; margin-bottom: 6px; line-height: 1.4; }
+.image-card .meta { color: #888; font-size: 11px; }
+.image-card a {
+    color: #4a90d9; text-decoration: none; font-weight: 500;
+}
+.image-card a:hover { text-decoration: underline; }
 
 #legend {
     position: absolute; bottom: 30px; right: 12px; z-index: 10;
@@ -111,8 +149,16 @@ h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
             </select>
         </div>
     </div>
+    <div id="breadcrumb"></div>
     <div id="status">Enter a search term to see geographic prevalence.</div>
     <div id="results-list"></div>
+</div>
+
+<div id="image-panel">
+    <span class="close-btn" onclick="closeImagePanel()">&times;</span>
+    <h3 id="image-panel-title">Images</h3>
+    <div id="image-panel-status" style="font-size:12px; color:#888; margin-bottom:8px;"></div>
+    <div id="image-list"></div>
 </div>
 
 <div id="legend" style="display:none;">
@@ -120,23 +166,28 @@ h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
     <div class="legend-scale" id="legend-scale"></div>
     <div class="legend-labels">
         <span id="legend-min">0%</span>
-        <span id="legend-max">—</span>
+        <span id="legend-max">--</span>
     </div>
 </div>
 
 <script>
 const COLORS = [
-    [240, 249, 232],  // very low — light green
+    [240, 249, 232],  // very low
     [186, 228, 179],
     [116, 196, 118],
     [49, 163, 84],
-    [0, 109, 44],     // high — dark green
+    [0, 109, 44],     // high
 ];
 
 let map;
 let currentResults = null;
+let currentQuery = '';
 let stateGeojson = null;
 let msaGeojson = null;
+
+// Drill-down state
+let drillStack = []; // [{level, label, bbox?}]
+let gridMarkers = []; // MapLibre markers for image pins
 
 // ── Map initialization ──────────────────────────────────────
 
@@ -166,12 +217,11 @@ function initMap() {
     });
 
     map.on('load', () => {
-        // Add empty sources for choropleth
+        // Choropleth source (state/MSA polygons)
         map.addSource('choropleth', {
             type: 'geojson',
             data: { type: 'FeatureCollection', features: [] }
         });
-
         map.addLayer({
             id: 'choropleth-fill',
             type: 'fill',
@@ -181,7 +231,6 @@ function initMap() {
                 'fill-opacity': 0.65
             }
         });
-
         map.addLayer({
             id: 'choropleth-outline',
             type: 'line',
@@ -193,26 +242,103 @@ function initMap() {
             }
         });
 
+        // Grid source (tile rectangles)
+        map.addSource('grid', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+        });
+        map.addLayer({
+            id: 'grid-fill',
+            type: 'fill',
+            source: 'grid',
+            paint: {
+                'fill-color': ['get', 'fill_color'],
+                'fill-opacity': 0.6
+            }
+        });
+        map.addLayer({
+            id: 'grid-outline',
+            type: 'line',
+            source: 'grid',
+            paint: {
+                'line-color': '#333',
+                'line-width': 0.8,
+                'line-opacity': 0.5
+            }
+        });
+
+        // Image markers source
+        map.addSource('image-points', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+        });
+        map.addLayer({
+            id: 'image-circles',
+            type: 'circle',
+            source: 'image-points',
+            paint: {
+                'circle-radius': 6,
+                'circle-color': '#e63946',
+                'circle-stroke-color': '#fff',
+                'circle-stroke-width': 1.5,
+                'circle-opacity': 0.85
+            }
+        });
+
         // Hover popup
         const popup = new maplibregl.Popup({
             closeButton: false, closeOnClick: false
         });
 
+        // Choropleth hover
         map.on('mousemove', 'choropleth-fill', (e) => {
             map.getCanvas().style.cursor = 'pointer';
             const props = e.features[0].properties;
-            const html = `<strong>${props.geo_name}</strong><br>
-                Prevalence: ${(props.prevalence * 100).toFixed(3)}%<br>
-                ${props.count.toLocaleString()} / ${props.total_images.toLocaleString()} images`;
-            popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+            popup.setLngLat(e.lngLat).setHTML(
+                `<strong>${props.geo_name}</strong><br>
+                 Prevalence: ${(props.prevalence * 100).toFixed(3)}%<br>
+                 ${props.count.toLocaleString()} / ${props.total_images.toLocaleString()} images`
+            ).addTo(map);
         });
-
         map.on('mouseleave', 'choropleth-fill', () => {
             map.getCanvas().style.cursor = '';
             popup.remove();
         });
 
-        // Load GeoJSON boundaries
+        // Grid hover
+        map.on('mousemove', 'grid-fill', (e) => {
+            map.getCanvas().style.cursor = 'pointer';
+            const p = e.features[0].properties;
+            popup.setLngLat(e.lngLat).setHTML(
+                `<strong>${p.tile_key}</strong><br>
+                 Prevalence: ${(p.prevalence * 100).toFixed(3)}%<br>
+                 ${p.count.toLocaleString()} / ${p.total.toLocaleString()} images`
+            ).addTo(map);
+        });
+        map.on('mouseleave', 'grid-fill', () => {
+            map.getCanvas().style.cursor = '';
+            popup.remove();
+        });
+
+        // Image point hover
+        map.on('mousemove', 'image-circles', (e) => {
+            map.getCanvas().style.cursor = 'pointer';
+            const p = e.features[0].properties;
+            const cap = p.caption.length > 120 ? p.caption.slice(0, 120) + '...' : p.caption;
+            popup.setLngLat(e.lngLat).setHTML(
+                `<strong>${p.image_id}</strong><br>${cap}`
+            ).addTo(map);
+        });
+        map.on('mouseleave', 'image-circles', () => {
+            map.getCanvas().style.cursor = '';
+            popup.remove();
+        });
+
+        // Click handlers for drill-down
+        map.on('click', 'choropleth-fill', onChoroplethClick);
+        map.on('click', 'grid-fill', onGridClick);
+        map.on('click', 'image-circles', onImageClick);
+
         loadBoundaries();
     });
 }
@@ -236,6 +362,13 @@ async function doSearch() {
     const query = document.getElementById('query').value.trim();
     if (!query) return;
 
+    currentQuery = query;
+    drillStack = [];
+    clearGrid();
+    clearImages();
+    closeImagePanel();
+    updateBreadcrumb();
+
     const mode = document.getElementById('mode').value;
     const geoLevel = document.getElementById('geo-level').value;
     const btn = document.getElementById('search-btn');
@@ -249,10 +382,7 @@ async function doSearch() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                query: query,
-                mode: mode,
-                geo_level: geoLevel,
-                top_k: 100000,
+                query, mode, geo_level: geoLevel, top_k: 100000,
             }),
         });
 
@@ -264,8 +394,9 @@ async function doSearch() {
         const data = await resp.json();
         currentResults = data.results;
 
-        status.textContent = `${data.results.length} geographies | ${data.elapsed_ms.toFixed(0)}ms | ${mode}`;
-        renderResults(data.results);
+        status.textContent =
+            `${data.results.length} geographies | ${data.elapsed_ms.toFixed(0)}ms | ${mode} | Click a region to drill down`;
+        renderResults(data.results, geoLevel);
         renderChoropleth(data.results, geoLevel);
 
     } catch (e) {
@@ -275,9 +406,124 @@ async function doSearch() {
     }
 }
 
-// ── Results list ────────────────────────────────────────────
+// ── Drill-down click handlers ───────────────────────────────
 
-function renderResults(results) {
+function onChoroplethClick(e) {
+    if (!currentQuery) return;
+    const props = e.features[0].properties;
+    const geoName = props.geo_name;
+
+    // Get bounding box of clicked feature
+    const feature = e.features[0];
+    const coords = feature.geometry.coordinates;
+    const bbox = getBBoxFromCoords(coords);
+
+    drillStack = [{ level: 'geo', label: geoName, bbox }];
+    updateBreadcrumb();
+
+    // Fly to the region and load z10 grid
+    map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40 });
+    loadGrid(currentQuery, 10, bbox);
+}
+
+function onGridClick(e) {
+    if (!currentQuery) return;
+    const props = e.features[0].properties;
+    const tileKey = props.tile_key;
+    const bbox = [props.west, props.south, props.east, props.north];
+
+    // Determine next zoom level
+    const currentZoom = parseInt(tileKey.split('/')[0].slice(1));
+    let nextZoom;
+    if (currentZoom <= 8) nextZoom = 10;
+    else if (currentZoom <= 10) nextZoom = 12;
+    else if (currentZoom <= 12) nextZoom = 14;
+    else {
+        // At z14, load individual images
+        loadImages(currentQuery, tileKey);
+        return;
+    }
+
+    drillStack.push({ level: `z${currentZoom}`, label: tileKey, bbox });
+    updateBreadcrumb();
+
+    map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
+
+    if (nextZoom <= 14) {
+        loadGrid(currentQuery, nextZoom, bbox);
+    }
+}
+
+function onImageClick(e) {
+    const props = e.features[0].properties;
+    window.open(props.mapillary_url, '_blank');
+}
+
+// ── Grid loading ────────────────────────────────────────────
+
+async function loadGrid(query, zoom, bbox) {
+    const status = document.getElementById('status');
+    status.textContent = `Loading z${zoom} grid...`;
+
+    clearImages();
+
+    try {
+        const resp = await fetch('/api/search/grid', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query, zoom, bbox }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || resp.statusText);
+        }
+
+        const data = await resp.json();
+        status.textContent =
+            `z${zoom}: ${data.tiles.length} tiles | ${data.elapsed_ms.toFixed(0)}ms | Click a tile to zoom in`;
+        renderGrid(data.tiles, zoom);
+        renderGridResults(data.tiles, zoom);
+
+    } catch (e) {
+        status.textContent = `Error: ${e.message}`;
+    }
+}
+
+async function loadImages(query, tileKey) {
+    const status = document.getElementById('status');
+    status.textContent = `Loading images in ${tileKey}...`;
+
+    try {
+        const resp = await fetch('/api/search/images', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query, tile_key: tileKey, limit: 200 }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || resp.statusText);
+        }
+
+        const data = await resp.json();
+        status.textContent =
+            `${data.images.length} matching images / ${data.total_in_area.toLocaleString()} total | ${data.elapsed_ms.toFixed(0)}ms`;
+
+        renderImageMarkers(data.images);
+        showImagePanel(data.images, data.total_in_area, tileKey);
+
+        drillStack.push({ level: 'images', label: tileKey });
+        updateBreadcrumb();
+
+    } catch (e) {
+        status.textContent = `Error: ${e.message}`;
+    }
+}
+
+// ── Rendering: results list ─────────────────────────────────
+
+function renderResults(results, geoLevel) {
     const container = document.getElementById('results-list');
     if (!results.length) {
         container.innerHTML = '<div style="color:#999; font-size:13px; padding:8px 0;">No results found.</div>';
@@ -285,11 +531,11 @@ function renderResults(results) {
     }
 
     const maxPrev = Math.max(...results.map(r => r.prevalence));
-    container.innerHTML = results.slice(0, 50).map(r => {
+    container.innerHTML = results.slice(0, 50).map((r, i) => {
         const pct = (r.prevalence * 100);
         const barWidth = maxPrev > 0 ? (r.prevalence / maxPrev * 100) : 0;
         return `
-            <div class="result-row">
+            <div class="result-row" onclick="clickResult(${i}, '${geoLevel}')">
                 <span class="result-name">${r.geo_name}</span>
                 <div class="result-bar">
                     <div class="result-bar-fill" style="width:${barWidth}%"></div>
@@ -300,47 +546,95 @@ function renderResults(results) {
     }).join('');
 }
 
-// ── Choropleth ──────────────────────────────────────────────
+function renderGridResults(tiles, zoom) {
+    const container = document.getElementById('results-list');
+    if (!tiles.length) {
+        container.innerHTML = '<div style="color:#999; font-size:13px; padding:8px 0;">No matching tiles.</div>';
+        return;
+    }
+
+    const maxPrev = Math.max(...tiles.map(t => t.prevalence));
+    container.innerHTML = tiles.slice(0, 50).map((t, i) => {
+        const pct = (t.prevalence * 100);
+        const barWidth = maxPrev > 0 ? (t.prevalence / maxPrev * 100) : 0;
+        return `
+            <div class="result-row" onclick="clickTileResult('${t.tile_key}', ${t.west}, ${t.south}, ${t.east}, ${t.north})">
+                <span class="result-name">${t.tile_key} (${t.count})</span>
+                <div class="result-bar">
+                    <div class="result-bar-fill" style="width:${barWidth}%"></div>
+                </div>
+                <span class="result-pct">${pct < 0.01 ? pct.toFixed(4) : pct.toFixed(2)}%</span>
+            </div>
+        `;
+    }).join('');
+}
+
+function clickResult(index, geoLevel) {
+    if (!currentResults || !currentResults[index]) return;
+    const r = currentResults[index];
+
+    // Find the feature in GeoJSON to get its bbox
+    const geojson = geoLevel === 'state' ? stateGeojson : msaGeojson;
+    if (!geojson) return;
+
+    const feature = geojson.features.find(f => f.properties.NAME === r.geo_name);
+    if (!feature) return;
+
+    const bbox = getBBoxFromCoords(feature.geometry.coordinates);
+    drillStack = [{ level: 'geo', label: r.geo_name, bbox }];
+    updateBreadcrumb();
+    map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40 });
+    loadGrid(currentQuery, 10, bbox);
+}
+
+function clickTileResult(tileKey, w, s, e, n) {
+    const currentZoom = parseInt(tileKey.split('/')[0].slice(1));
+    let nextZoom;
+    if (currentZoom <= 8) nextZoom = 10;
+    else if (currentZoom <= 10) nextZoom = 12;
+    else if (currentZoom <= 12) nextZoom = 14;
+    else {
+        loadImages(currentQuery, tileKey);
+        return;
+    }
+
+    drillStack.push({ level: `z${currentZoom}`, label: tileKey, bbox: [w, s, e, n] });
+    updateBreadcrumb();
+    map.fitBounds([[w, s], [e, n]], { padding: 20 });
+
+    if (nextZoom <= 14) {
+        loadGrid(currentQuery, nextZoom, [w, s, e, n]);
+    }
+}
+
+// ── Rendering: choropleth ───────────────────────────────────
 
 function renderChoropleth(results, geoLevel) {
+    // Clear grid and images when showing choropleth
+    clearGrid();
+    clearImages();
+
     const geojson = geoLevel === 'state' ? stateGeojson : msaGeojson;
     if (!geojson || !results.length) {
         document.getElementById('legend').style.display = 'none';
         return;
     }
 
-    // Build lookup: geo_name -> result
     const lookup = {};
-    for (const r of results) {
-        lookup[r.geo_name] = r;
-    }
-
+    for (const r of results) lookup[r.geo_name] = r;
     const maxPrev = Math.max(...results.map(r => r.prevalence));
+    const nameKey = 'NAME';
 
-    // Property name in GeoJSON for matching
-    const nameKey = geoLevel === 'state' ? 'NAME' : 'NAME';
-
-    // Assign colors to features
     const colored = {
         type: 'FeatureCollection',
         features: geojson.features.map(f => {
             const name = f.properties[nameKey];
             const match = lookup[name];
             let color = 'rgba(200,200,200,0.3)';
-            let prevalence = 0;
-            let count = 0;
-            let total = 0;
+            let prevalence = 0, count = 0, total = 0;
 
             if (match && maxPrev > 0) {
-                const t = match.prevalence / maxPrev;
-                const ci = Math.min(Math.floor(t * (COLORS.length - 1)), COLORS.length - 2);
-                const frac = t * (COLORS.length - 1) - ci;
-                const c0 = COLORS[ci];
-                const c1 = COLORS[ci + 1];
-                const r = Math.round(c0[0] + (c1[0] - c0[0]) * frac);
-                const g = Math.round(c0[1] + (c1[1] - c0[1]) * frac);
-                const b = Math.round(c0[2] + (c1[2] - c0[2]) * frac);
-                color = `rgb(${r},${g},${b})`;
+                color = prevColor(match.prevalence, maxPrev);
                 prevalence = match.prevalence;
                 count = match.count;
                 total = match.total_images;
@@ -352,26 +646,244 @@ function renderChoropleth(results, geoLevel) {
                     ...f.properties,
                     geo_name: name,
                     fill_color: color,
-                    prevalence: prevalence,
-                    count: count,
-                    total_images: total,
+                    prevalence, count, total_images: total,
                 }
             };
         })
     };
 
     map.getSource('choropleth').setData(colored);
+    updateLegend(maxPrev);
+}
 
-    // Update legend
+// ── Rendering: grid tiles ───────────────────────────────────
+
+function renderGrid(tiles, zoom) {
+    if (!tiles.length) {
+        clearGrid();
+        return;
+    }
+
+    const maxPrev = Math.max(...tiles.map(t => t.prevalence));
+
+    const features = tiles.map(t => ({
+        type: 'Feature',
+        properties: {
+            tile_key: t.tile_key,
+            fill_color: prevColor(t.prevalence, maxPrev),
+            prevalence: t.prevalence,
+            count: t.count,
+            total: t.total,
+            west: t.west, south: t.south, east: t.east, north: t.north,
+        },
+        geometry: {
+            type: 'Polygon',
+            coordinates: [[
+                [t.west, t.south],
+                [t.east, t.south],
+                [t.east, t.north],
+                [t.west, t.north],
+                [t.west, t.south],
+            ]]
+        }
+    }));
+
+    map.getSource('grid').setData({ type: 'FeatureCollection', features });
+
+    // Dim the choropleth when grid is active
+    map.setPaintProperty('choropleth-fill', 'fill-opacity', 0.15);
+    updateLegend(maxPrev);
+}
+
+function clearGrid() {
+    if (map && map.getSource('grid')) {
+        map.getSource('grid').setData({ type: 'FeatureCollection', features: [] });
+    }
+    if (map) {
+        map.setPaintProperty('choropleth-fill', 'fill-opacity', 0.65);
+    }
+}
+
+// ── Rendering: image markers ────────────────────────────────
+
+function renderImageMarkers(images) {
+    clearImages();
+    if (!images.length) return;
+
+    const features = images.map(img => ({
+        type: 'Feature',
+        properties: {
+            image_id: img.image_id,
+            caption: img.caption,
+            mapillary_url: img.mapillary_url,
+        },
+        geometry: {
+            type: 'Point',
+            coordinates: [img.lng, img.lat]
+        }
+    }));
+
+    map.getSource('image-points').setData({ type: 'FeatureCollection', features });
+
+    // Dim grid when showing images
+    map.setPaintProperty('grid-fill', 'fill-opacity', 0.2);
+}
+
+function clearImages() {
+    if (map && map.getSource('image-points')) {
+        map.getSource('image-points').setData({ type: 'FeatureCollection', features: [] });
+    }
+    if (map) {
+        map.setPaintProperty('grid-fill', 'fill-opacity', 0.6);
+    }
+}
+
+// ── Image panel ─────────────────────────────────────────────
+
+function showImagePanel(images, totalInArea, tileKey) {
+    const panel = document.getElementById('image-panel');
+    const title = document.getElementById('image-panel-title');
+    const statusEl = document.getElementById('image-panel-status');
+    const list = document.getElementById('image-list');
+
+    title.textContent = `Images in ${tileKey}`;
+    statusEl.textContent = `${images.length} matching / ${totalInArea.toLocaleString()} total in area`;
+
+    list.innerHTML = images.slice(0, 100).map(img => {
+        const cap = img.caption.length > 200 ? img.caption.slice(0, 200) + '...' : img.caption;
+        return `
+            <div class="image-card">
+                <div class="caption">${escapeHtml(cap)}</div>
+                <div class="meta">
+                    <a href="${img.mapillary_url}" target="_blank">View on Mapillary</a>
+                    &nbsp;|&nbsp; ${img.lat}, ${img.lng}
+                </div>
+            </div>
+        `;
+    }).join('');
+
+    panel.style.display = 'block';
+    // Move legend to account for panel
+    document.getElementById('legend').style.right = '404px';
+}
+
+function closeImagePanel() {
+    document.getElementById('image-panel').style.display = 'none';
+    document.getElementById('legend').style.right = '12px';
+}
+
+// ── Breadcrumb navigation ───────────────────────────────────
+
+function updateBreadcrumb() {
+    const bc = document.getElementById('breadcrumb');
+
+    if (!drillStack.length) {
+        bc.style.display = 'none';
+        return;
+    }
+
+    bc.style.display = 'block';
+    let html = `<span class="crumb" onclick="navigateTo(-1)">Overview</span>`;
+
+    for (let i = 0; i < drillStack.length; i++) {
+        const item = drillStack[i];
+        html += `<span class="sep">&rsaquo;</span>`;
+        if (i < drillStack.length - 1) {
+            html += `<span class="crumb" onclick="navigateTo(${i})">${item.label}</span>`;
+        } else {
+            html += `<span class="current">${item.label}</span>`;
+        }
+    }
+
+    bc.innerHTML = html;
+}
+
+function navigateTo(index) {
+    if (index < 0) {
+        // Back to overview
+        drillStack = [];
+        clearGrid();
+        clearImages();
+        closeImagePanel();
+        updateBreadcrumb();
+
+        const geoLevel = document.getElementById('geo-level').value;
+        if (currentResults) {
+            renderChoropleth(currentResults, geoLevel);
+            renderResults(currentResults, geoLevel);
+            document.getElementById('status').textContent =
+                `${currentResults.length} geographies | Click a region to drill down`;
+        }
+        map.flyTo({ center: [-98.5, 39.8], zoom: 4 });
+        return;
+    }
+
+    // Navigate to a specific drill level
+    const target = drillStack[index];
+    drillStack = drillStack.slice(0, index + 1);
+    clearImages();
+    closeImagePanel();
+    updateBreadcrumb();
+
+    if (target.bbox) {
+        map.fitBounds([[target.bbox[0], target.bbox[1]], [target.bbox[2], target.bbox[3]]], { padding: 40 });
+
+        // Determine what zoom to show
+        const level = target.level;
+        if (level === 'geo') {
+            loadGrid(currentQuery, 10, target.bbox);
+        } else if (level.startsWith('z')) {
+            const z = parseInt(level.slice(1));
+            let nextZoom = z <= 8 ? 10 : z <= 10 ? 12 : 14;
+            loadGrid(currentQuery, nextZoom, target.bbox);
+        }
+    }
+}
+
+// ── Utilities ───────────────────────────────────────────────
+
+function prevColor(prevalence, maxPrev) {
+    const t = maxPrev > 0 ? prevalence / maxPrev : 0;
+    const ci = Math.min(Math.floor(t * (COLORS.length - 1)), COLORS.length - 2);
+    const frac = t * (COLORS.length - 1) - ci;
+    const c0 = COLORS[ci], c1 = COLORS[ci + 1];
+    const r = Math.round(c0[0] + (c1[0] - c0[0]) * frac);
+    const g = Math.round(c0[1] + (c1[1] - c0[1]) * frac);
+    const b = Math.round(c0[2] + (c1[2] - c0[2]) * frac);
+    return `rgb(${r},${g},${b})`;
+}
+
+function updateLegend(maxPrev) {
     const legend = document.getElementById('legend');
     legend.style.display = 'block';
     document.getElementById('legend-max').textContent = (maxPrev * 100).toFixed(2) + '%';
-
     const scale = document.getElementById('legend-scale');
-    scale.innerHTML = COLORS.map((c, i) => {
+    scale.innerHTML = COLORS.map(c => {
         const w = 100 / COLORS.length;
         return `<div style="width:${w}%;background:rgb(${c[0]},${c[1]},${c[2]})"></div>`;
     }).join('');
+}
+
+function getBBoxFromCoords(coords) {
+    let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+    function walk(arr) {
+        if (typeof arr[0] === 'number') {
+            minLng = Math.min(minLng, arr[0]);
+            minLat = Math.min(minLat, arr[1]);
+            maxLng = Math.max(maxLng, arr[0]);
+            maxLat = Math.max(maxLat, arr[1]);
+        } else {
+            for (const sub of arr) walk(sub);
+        }
+    }
+    walk(coords);
+    return [minLng, minLat, maxLng, maxLat];
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
 // ── Keyboard shortcut ───────────────────────────────────────

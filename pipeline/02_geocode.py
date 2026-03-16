@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Step 2: Reverse-geocode images to US states and MSAs (CBSAs).
+Step 2: Reverse-geocode images to US states and MSAs (CBSAs),
+and assign Web Mercator tile coordinates at z8, z10, z12, z14.
 
 Uses Census TIGER/Line shapefiles for point-in-polygon lookups.
 Downloads shapefiles automatically if not present.
@@ -9,7 +10,8 @@ Input:  data/extracts/meta_*.parquet
 Output: data/image_geography.parquet
           Columns: image_id, sequence_id, lat, lng, caption, captured_at,
                    state_fips, state_name, state_abbr,
-                   cbsa_id, cbsa_name
+                   cbsa_id, cbsa_name,
+                   z8_tile, z10_tile, z12_tile, z14_tile
 
 Usage:
   python pipeline/02_geocode.py
@@ -18,11 +20,13 @@ Usage:
 
 import argparse
 import io
+import math
 import os
 import zipfile
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import requests
 from shapely.geometry import Point
@@ -36,6 +40,31 @@ TIGER_URLS = {
     "states": "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_state_20m.zip",
     "cbsa": "https://www2.census.gov/geo/tiger/GENZ2023/shp/cb_2023_us_cbsa_20m.zip",
 }
+
+
+def lat_lon_to_tile(lat, lon, zoom):
+    """Convert lat/lon to Web Mercator tile (x, y) at given zoom level."""
+    lat_rad = math.radians(lat)
+    n = 2 ** zoom
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+    x = max(0, min(n - 1, x))
+    y = max(0, min(n - 1, y))
+    return x, y
+
+
+def compute_tile_keys(lats, lngs, zoom):
+    """Vectorized tile key computation for arrays of lat/lng.
+
+    Returns array of strings like 'z10/512/345'.
+    """
+    lat_rad = np.radians(lats)
+    n = 2 ** zoom
+    x = ((lngs + 180.0) / 360.0 * n).astype(np.int32)
+    y = ((1.0 - np.log(np.tan(lat_rad) + 1.0 / np.cos(lat_rad)) / np.pi) / 2.0 * n).astype(np.int32)
+    x = np.clip(x, 0, n - 1)
+    y = np.clip(y, 0, n - 1)
+    return pd.array([f"z{zoom}/{xi}/{yi}" for xi, yi in zip(x, y)], dtype="string")
 
 
 def download_shapefile(name, url, dest_dir):
@@ -152,6 +181,15 @@ def geocode(df, states_gdf, cbsa_gdf):
 
     # Drop geometry column for parquet output
     result = pd.DataFrame(result.drop(columns=["geometry"]))
+
+    # Compute tile coordinates at z8, z10, z12, z14
+    print("Computing tile coordinates...")
+    lats = result["lat"].values.astype(np.float64)
+    lngs = result["lng"].values.astype(np.float64)
+    for zoom in (8, 10, 12, 14):
+        result[f"z{zoom}_tile"] = compute_tile_keys(lats, lngs, zoom)
+    n_z10_tiles = result["z10_tile"].nunique()
+    print(f"  Tile coverage: {n_z10_tiles:,} z10 tiles, {result['z14_tile'].nunique():,} z14 tiles")
 
     # Report coverage
     in_state = result["state_name"].notna().sum()

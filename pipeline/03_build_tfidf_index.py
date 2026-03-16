@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 3: Build a stemmed keyword prevalence index from captions.
+Step 3: Build stemmed keyword prevalence indexes from captions.
 
 For each (stemmed_term, geography) pair, stores the count of images whose
 caption contains that term.  At query time, prevalence = count / total_images.
@@ -8,16 +8,24 @@ caption contains that term.  At query time, prevalence = count / total_images.
 Also builds a TF-IDF matrix where each "document" is a geography (all
 captions concatenated), enabling TF-IDF-weighted ranking of geographies.
 
+Supports multiple geo levels:
+  - state / msa: pre-existing admin boundary levels
+  - z8 / z10:    Web Mercator tile grid levels (for drill-down)
+
+Also creates per-z10-tile caption partitions (data/captions_by_tile/)
+for on-demand z12/z14 queries at runtime.
+
 Input:  data/image_geography.parquet
-Output: data/keyword_index.pkl        - {term: {geo: count}} dict
-        data/tfidf_model.pkl          - fitted TfidfVectorizer + matrix
-        data/geography_stats.json     - image counts per geography
+Output: data/keyword_index_{level}.pkl - {term: {geo: count}} dict
+        data/tfidf_model_{level}.pkl   - fitted TfidfVectorizer + matrix
+        data/geography_stats.json      - image counts per geography
+        data/captions_by_tile/*.parquet - per-z10-tile caption partitions
 
 Usage:
   python pipeline/03_build_tfidf_index.py
-  python pipeline/03_build_tfidf_index.py --geo-level state   # states only
-  python pipeline/03_build_tfidf_index.py --geo-level msa     # MSAs only
-  python pipeline/03_build_tfidf_index.py --geo-level both    # default
+  python pipeline/03_build_tfidf_index.py --geo-level state
+  python pipeline/03_build_tfidf_index.py --geo-level z10
+  python pipeline/03_build_tfidf_index.py --geo-level all    # default
 """
 
 import argparse
@@ -152,12 +160,49 @@ def build_tfidf_matrix(df, geo_col):
     return vectorizer, tfidf_matrix, geo_names
 
 
+def build_caption_partitions(df, partition_col, output_dir):
+    """Partition image captions by tile key for on-demand z12/z14 queries.
+
+    Each partition file contains image_id, lat, lng, caption, sequence_id,
+    and finer-grained tile keys (z12_tile, z14_tile).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  Building caption partitions by {partition_col}...")
+    t0 = time.time()
+
+    cols = ["image_id", "sequence_id", "lat", "lng", "caption",
+            "z12_tile", "z14_tile"]
+    # Only keep columns that exist
+    cols = [c for c in cols if c in df.columns]
+    cols.append(partition_col)
+
+    subset = df[cols].dropna(subset=[partition_col, "caption"])
+    n_partitions = 0
+
+    for tile_key, group in subset.groupby(partition_col):
+        # Convert tile key like "z10/512/345" to a safe filename
+        safe_name = tile_key.replace("/", "_")
+        group.drop(columns=[partition_col]).to_parquet(
+            output_dir / f"{safe_name}.parquet", index=False
+        )
+        n_partitions += 1
+
+    elapsed = time.time() - t0
+    print(f"    {n_partitions:,} partition files ({elapsed:.1f}s)")
+    return n_partitions
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build TF-IDF keyword index")
     parser.add_argument(
         "--geo-level",
-        choices=["state", "msa", "both"],
-        default="both",
+        choices=["state", "msa", "z8", "z10", "both", "all"],
+        default="all",
+    )
+    parser.add_argument(
+        "--skip-partitions",
+        action="store_true",
+        help="Skip building per-z10-tile caption partitions",
     )
     args = parser.parse_args()
 
@@ -167,18 +212,39 @@ def main():
         raise SystemExit(1)
 
     print("Loading geocoded data...")
-    df = pd.read_parquet(geo_path, columns=["image_id", "caption", "state_name", "cbsa_name"])
+    needed_cols = ["image_id", "sequence_id", "lat", "lng", "caption",
+                   "state_name", "cbsa_name", "z8_tile", "z10_tile",
+                   "z12_tile", "z14_tile"]
+    # Only load columns that exist in the file
+    import pyarrow.parquet as pq
+    available_cols = pq.read_schema(geo_path).names
+    load_cols = [c for c in needed_cols if c in available_cols]
+    df = pd.read_parquet(geo_path, columns=load_cols)
     print(f"  {len(df):,} images")
 
     results = {}
 
-    levels = []
-    if args.geo_level in ("state", "both"):
-        levels.append(("state", "state_name"))
-    if args.geo_level in ("msa", "both"):
-        levels.append(("msa", "cbsa_name"))
+    # Define all available levels and their column names
+    all_levels = {
+        "state": "state_name",
+        "msa": "cbsa_name",
+        "z8": "z8_tile",
+        "z10": "z10_tile",
+    }
+
+    # Determine which levels to build
+    if args.geo_level == "all":
+        levels = list(all_levels.items())
+    elif args.geo_level == "both":
+        levels = [("state", "state_name"), ("msa", "cbsa_name")]
+    else:
+        levels = [(args.geo_level, all_levels[args.geo_level])]
 
     for level_name, geo_col in levels:
+        if geo_col not in df.columns:
+            print(f"\n=== {level_name.upper()} level === SKIPPED (column {geo_col} not found)")
+            continue
+
         print(f"\n=== {level_name.upper()} level ===")
 
         kw_index, geo_totals = build_keyword_index(df, geo_col)
@@ -204,6 +270,12 @@ def main():
         print(f"  Saved TF-IDF model: {tfidf_path}")
 
         results[level_name] = geo_totals
+
+    # Build per-z10 caption partitions for on-demand z12/z14 queries
+    if not args.skip_partitions and "z10_tile" in df.columns:
+        print("\n=== Caption partitions (by z10 tile) ===")
+        partition_dir = DATA_DIR / "captions_by_tile"
+        build_caption_partitions(df, "z10_tile", partition_dir)
 
     # Save geography stats
     stats_path = DATA_DIR / "geography_stats.json"
