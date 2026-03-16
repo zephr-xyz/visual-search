@@ -174,22 +174,28 @@ def main():
     all_images = []  # [(seq_id, img_id), ...]
     done = 0
 
-    with ThreadPoolExecutor(max_workers=args.list_workers) as pool:
-        futures = {pool.submit(list_images_in_sequence, seq): seq for seq in sequences}
-        for fut in as_completed(futures):
-            try:
-                seq_id, images = fut.result()
-                for img_id in images:
-                    all_images.append((seq_id, img_id))
-            except Exception as e:
-                print(f"[{tag}] WARN: listing failed: {e}", flush=True)
-            done += 1
-            if done % 1000 == 0:
-                print(
-                    f"[{tag}]   Listed {done}/{len(sequences)} sequences, "
-                    f"{len(all_images):,} images so far ({time.time()-t0:.0f}s)",
-                    flush=True,
-                )
+    try:
+        with ThreadPoolExecutor(max_workers=args.list_workers) as pool:
+            futures = {pool.submit(list_images_in_sequence, seq): seq for seq in sequences}
+            for fut in as_completed(futures):
+                try:
+                    seq_id, images = fut.result()
+                    for img_id in images:
+                        all_images.append((seq_id, img_id))
+                except Exception as e:
+                    print(f"[{tag}] WARN: listing failed: {e}", flush=True)
+                done += 1
+                if done % 1000 == 0:
+                    print(
+                        f"[{tag}]   Listed {done}/{len(sequences)} sequences, "
+                        f"{len(all_images):,} images so far ({time.time()-t0:.0f}s)",
+                        flush=True,
+                    )
+    except Exception as e:
+        print(f"[{tag}] FATAL in Phase 1: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
     listing_time = time.time() - t0
     print(
@@ -202,10 +208,12 @@ def main():
         print(f"[{tag}] No images found.", flush=True)
         return
 
-    # ── Phase 2: Download all images ────────────────────────────
+    # ── Phase 2: Download images in chunks ─────────────────────
+    CHUNK = 10_000  # Process this many images at a time to limit memory
+    n_total = len(all_images)
     print(
-        f"[{tag}] Phase 2: Downloading {len(all_images):,} images "
-        f"({args.download_workers} threads)...",
+        f"[{tag}] Phase 2: Downloading {n_total:,} images "
+        f"({args.download_workers} threads, chunks of {CHUNK:,})...",
         flush=True,
     )
     t_start = time.time()
@@ -215,68 +223,71 @@ def main():
     errors = 0
     t_last_log = t_start
 
-    with ThreadPoolExecutor(max_workers=args.download_workers) as pool:
-        futures = {
-            pool.submit(download_one_image, seq_id, img_id, args.skip_embeddings): (seq_id, img_id)
-            for seq_id, img_id in all_images
-        }
+    for chunk_start in range(0, n_total, CHUNK):
+        chunk = all_images[chunk_start : chunk_start + CHUNK]
 
-        for fut in as_completed(futures):
-            completed += 1
-            try:
-                result = fut.result()
-            except Exception:
-                errors += 1
-                continue
+        with ThreadPoolExecutor(max_workers=args.download_workers) as pool:
+            futures = {
+                pool.submit(download_one_image, seq_id, img_id, args.skip_embeddings): idx
+                for idx, (seq_id, img_id) in enumerate(chunk)
+            }
 
-            if result is None:
-                continue
+            for fut in as_completed(futures):
+                completed += 1
+                try:
+                    result = fut.result()
+                except Exception:
+                    errors += 1
+                    continue
 
-            record, embedding = result
-            batch_records.append(record)
-            if embedding is not None:
-                batch_embeddings.append(embedding)
+                if result is None:
+                    continue
 
-            # Flush batch
-            if len(batch_records) >= args.batch_size:
-                n = flush_batch(
-                    batch_records, batch_embeddings, batch_num,
-                    output_dir, args.skip_embeddings, tag,
-                )
-                total_images += n
-                elapsed = time.time() - t_start
-                rate = total_images / elapsed if elapsed > 0 else 0
-                pct = completed / len(all_images) * 100
-                print(
-                    f"[{tag}] Batch {batch_num}: {n:,} images | "
-                    f"Total: {total_images:,} | "
-                    f"{completed:,}/{len(all_images):,} ({pct:.1f}%) | "
-                    f"{rate:.0f} img/s | {elapsed:.0f}s",
-                    flush=True,
-                )
-                batch_records = []
-                batch_embeddings = []
-                batch_num += 1
-                with open(ckpt_path, "w") as f:
-                    json.dump({"next_batch_num": batch_num, "total_images": total_images}, f)
+                record, embedding = result
+                batch_records.append(record)
+                if embedding is not None:
+                    batch_embeddings.append(embedding)
 
-            # Progress log every 30 seconds
-            now = time.time()
-            if now - t_last_log >= 30:
-                elapsed = now - t_start
-                effective = total_images + len(batch_records)
-                rate = effective / elapsed if elapsed > 0 else 0
-                pct = completed / len(all_images) * 100
-                est_remaining = (len(all_images) - completed) / (completed / elapsed) if completed > 0 else 0
-                print(
-                    f"[{tag}] {effective:,} images ({len(batch_records):,} pending) | "
-                    f"{completed:,}/{len(all_images):,} ({pct:.1f}%) | "
-                    f"~{rate:.0f} img/s | "
-                    f"errors: {errors} | "
-                    f"ETA: {est_remaining/3600:.1f}h | {elapsed:.0f}s",
-                    flush=True,
-                )
-                t_last_log = now
+                # Flush batch
+                if len(batch_records) >= args.batch_size:
+                    n = flush_batch(
+                        batch_records, batch_embeddings, batch_num,
+                        output_dir, args.skip_embeddings, tag,
+                    )
+                    total_images += n
+                    elapsed = time.time() - t_start
+                    rate = total_images / elapsed if elapsed > 0 else 0
+                    pct = completed / n_total * 100
+                    print(
+                        f"[{tag}] Batch {batch_num}: {n:,} images | "
+                        f"Total: {total_images:,} | "
+                        f"{completed:,}/{n_total:,} ({pct:.1f}%) | "
+                        f"{rate:.0f} img/s | {elapsed:.0f}s",
+                        flush=True,
+                    )
+                    batch_records = []
+                    batch_embeddings = []
+                    batch_num += 1
+                    with open(ckpt_path, "w") as f:
+                        json.dump({"next_batch_num": batch_num, "total_images": total_images}, f)
+
+                # Progress log every 30 seconds
+                now = time.time()
+                if now - t_last_log >= 30:
+                    elapsed = now - t_start
+                    effective = total_images + len(batch_records)
+                    rate = effective / elapsed if elapsed > 0 else 0
+                    pct = completed / n_total * 100
+                    est_remaining = (n_total - completed) / (completed / elapsed) if completed > 0 else 0
+                    print(
+                        f"[{tag}] {effective:,} images ({len(batch_records):,} pending) | "
+                        f"{completed:,}/{n_total:,} ({pct:.1f}%) | "
+                        f"~{rate:.0f} img/s | "
+                        f"errors: {errors} | "
+                        f"ETA: {est_remaining/3600:.1f}h | {elapsed:.0f}s",
+                        flush=True,
+                    )
+                    t_last_log = now
 
     # Final flush
     if batch_records:
