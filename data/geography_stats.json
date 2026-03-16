@@ -1,0 +1,12 @@
+{
+  "state": {
+    "Michigan": 166,
+    "Texas": 117,
+    "Georgia": 506
+  },
+  "msa": {
+    "Detroit-Warren-Dearborn, MI": 166,
+    "Houston-Pasadena-The Woodlands, TX": 117,
+    "Atlanta-Sandy Springs-Roswell, GA": 506
+  }
+}
