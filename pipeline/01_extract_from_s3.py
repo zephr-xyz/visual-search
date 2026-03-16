@@ -2,39 +2,26 @@
 """
 Step 1: Extract captions, metadata, and caption embeddings from S3.
 
-Downloads from s3://zephr-mapillary-computed-data/:
-  {sequence_id}/{image_id}/caption.txt
-  {sequence_id}/{image_id}/metadata.json
-  {sequence_id}/{image_id}/caption_embedding.npz
-
-Uses a pipelined architecture: sequence listing and image downloads run
-concurrently in a single thread pool for maximum throughput.
-
-Outputs batched files to data/extracts/:
-  meta_{shard}_{batch:06d}.parquet  - image metadata + captions
-  emb_{shard}_{batch:06d}.npy       - caption embeddings (N, 768) float32
+Two-phase approach:
+  Phase 1: List all images across sequences (32 parallel threads, ~2 min)
+  Phase 2: Download caption + metadata + embedding per image (200 parallel threads)
 
 Usage:
-  # Sharded parallel run (4 processes)
   python pipeline/01_extract_from_s3.py --shard 0/4 &
   python pipeline/01_extract_from_s3.py --shard 1/4 &
   python pipeline/01_extract_from_s3.py --shard 2/4 &
   python pipeline/01_extract_from_s3.py --shard 3/4 &
-
-  # Test
-  python pipeline/01_extract_from_s3.py --limit-sequences 10
+  python pipeline/01_extract_from_s3.py --limit-sequences 10   # test
 """
 
 import argparse
 import io
 import json
-import os
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from queue import Queue, Empty
 
 import boto3
 import numpy as np
@@ -43,10 +30,8 @@ from botocore.config import Config
 
 BUCKET = "zephr-mapillary-computed-data"
 BATCH_SIZE = 50_000
-MAX_WORKERS = 200
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Thread-local S3 clients
 _local = threading.local()
 _s3_config = None
 
@@ -57,10 +42,10 @@ def get_s3():
     return _local.s3
 
 
-def init_s3(max_workers):
+def init_s3(max_pool):
     global _s3_config
     _s3_config = Config(
-        max_pool_connections=max_workers + 10,
+        max_pool_connections=max_pool + 10,
         retries={"max_attempts": 3, "mode": "adaptive"},
     )
     return boto3.client("s3", region_name="us-east-2", config=_s3_config)
@@ -68,51 +53,33 @@ def init_s3(max_workers):
 
 def list_sequences(s3, limit=None):
     paginator = s3.get_paginator("list_objects_v2")
-    sequences = []
+    seqs = []
     for page in paginator.paginate(Bucket=BUCKET, Delimiter="/"):
         for p in page.get("CommonPrefixes", []):
             prefix = p["Prefix"].rstrip("/")
             if not prefix.startswith("."):
-                sequences.append(prefix)
-                if limit and len(sequences) >= limit:
-                    return sequences
-    return sequences
+                seqs.append(prefix)
+                if limit and len(seqs) >= limit:
+                    return seqs
+    return seqs
 
 
-def list_and_submit_images(seq_id, pool, skip_embeddings, result_queue, counter):
-    """List images in a sequence and submit download tasks.
-
-    This runs inside the thread pool — listing and downloads overlap.
-    """
+def list_images_in_sequence(seq_id):
+    """List image IDs in one sequence. Uses thread-local S3 client."""
     s3 = get_s3()
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(
-            Bucket=BUCKET, Prefix=f"{seq_id}/", Delimiter="/"
-        ):
-            for p in page.get("CommonPrefixes", []):
-                img_id = p["Prefix"].rstrip("/").split("/")[-1]
-                fut = pool.submit(download_one_image, seq_id, img_id, skip_embeddings)
-                fut.add_done_callback(lambda f, q=result_queue, c=counter: _on_done(f, q, c))
-    except Exception as e:
-        print(f"  WARN: list failed for {seq_id}: {e}", flush=True)
+    images = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{seq_id}/", Delimiter="/"):
+        for p in page.get("CommonPrefixes", []):
+            img_id = p["Prefix"].rstrip("/").split("/")[-1]
+            images.append(img_id)
+    return seq_id, images
 
 
-def _on_done(future, result_queue, counter):
-    """Callback when a download completes."""
-    try:
-        result = future.result()
-        if result is not None:
-            result_queue.put(result)
-        counter["submitted"] += 1
-    except Exception:
-        counter["errors"] += 1
-
-
-def download_one_image(sequence_id, image_id, skip_embeddings=False):
+def download_one_image(seq_id, img_id, skip_embeddings):
     """Download metadata + caption + embedding for one image."""
     s3 = get_s3()
-    prefix = f"{sequence_id}/{image_id}/"
+    prefix = f"{seq_id}/{img_id}/"
 
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=f"{prefix}metadata.json")
@@ -121,8 +88,8 @@ def download_one_image(sequence_id, image_id, skip_embeddings=False):
         return None
 
     record = {
-        "image_id": image_id,
-        "sequence_id": sequence_id,
+        "image_id": img_id,
+        "sequence_id": seq_id,
         "lat": meta["geometry"]["lat"],
         "lng": meta["geometry"]["lng"],
         "compass_angle": meta.get("compass_angle", 0.0),
@@ -140,9 +107,7 @@ def download_one_image(sequence_id, image_id, skip_embeddings=False):
     embedding = None
     if not skip_embeddings:
         try:
-            obj = s3.get_object(
-                Bucket=BUCKET, Key=f"{prefix}caption_embedding.npz"
-            )
+            obj = s3.get_object(Bucket=BUCKET, Key=f"{prefix}caption_embedding.npz")
             data = np.load(io.BytesIO(obj["Body"].read()))
             emb = data["data"].astype(np.float32)
             if emb.shape == (768,):
@@ -158,186 +123,178 @@ def download_one_image(sequence_id, image_id, skip_embeddings=False):
     return record, embedding
 
 
-def flush_batch(records, embeddings, batch_num, output_dir, skip_embeddings, shard_tag):
+def flush_batch(records, embeddings, batch_num, output_dir, skip_emb, tag):
     df = pd.DataFrame(records)
-    df.to_parquet(output_dir / f"meta_{shard_tag}_{batch_num:06d}.parquet", index=False)
-    if not skip_embeddings and embeddings:
-        np.save(output_dir / f"emb_{shard_tag}_{batch_num:06d}.npy", np.stack(embeddings))
+    df.to_parquet(output_dir / f"meta_{tag}_{batch_num:06d}.parquet", index=False)
+    if not skip_emb and embeddings:
+        np.save(output_dir / f"emb_{tag}_{batch_num:06d}.npy", np.stack(embeddings))
     return len(records)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract image data from S3")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--limit-sequences", type=int, default=None)
     parser.add_argument("--skip-embeddings", action="store_true")
-    parser.add_argument("--shard", type=str, default=None, help="N/M shard spec")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS)
+    parser.add_argument("--shard", type=str, default=None, help="N/M")
+    parser.add_argument("--download-workers", type=int, default=200)
+    parser.add_argument("--list-workers", type=int, default=32)
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     shard_idx, shard_total = 0, 1
-    shard_tag = "s0"
+    tag = "s0"
     if args.shard:
         shard_idx, shard_total = int(args.shard.split("/")[0]), int(args.shard.split("/")[1])
-        shard_tag = f"s{shard_idx}"
+        tag = f"s{shard_idx}"
 
     output_dir = BASE_DIR / "data" / "extracts"
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = BASE_DIR / "data" / f"extract_checkpoint_{shard_tag}.json"
+    ckpt_path = BASE_DIR / "data" / f"extract_checkpoint_{tag}.json"
 
-    # Resume
     batch_num = 0
     total_images = 0
-    start_seq_idx = 0
-    if args.resume and checkpoint_path.exists():
-        ckpt = json.loads(checkpoint_path.read_text())
-        start_seq_idx = ckpt["next_sequence_idx"]
+    skip_images = set()
+    if args.resume and ckpt_path.exists():
+        ckpt = json.loads(ckpt_path.read_text())
         batch_num = ckpt["next_batch_num"]
         total_images = ckpt["total_images"]
-        print(f"Resuming: seq={start_seq_idx}, batch={batch_num}, images={total_images}", flush=True)
+        print(f"[{tag}] Resuming: batch={batch_num}, images={total_images}", flush=True)
 
-    s3 = init_s3(args.workers)
+    s3 = init_s3(args.download_workers)
 
-    print(f"[{shard_tag}] Listing sequences...", flush=True)
-    all_sequences = list_sequences(s3, limit=args.limit_sequences)
-    sequences = [seq for i, seq in enumerate(all_sequences) if i % shard_total == shard_idx]
-    sequences = sequences[start_seq_idx:]
-    print(f"[{shard_tag}] {len(sequences)} sequences to process", flush=True)
+    # ── Phase 1: List all sequences and images ──────────────────
+    print(f"[{tag}] Listing sequences...", flush=True)
+    all_seqs = list_sequences(s3, limit=args.limit_sequences)
+    sequences = [seq for i, seq in enumerate(all_seqs) if i % shard_total == shard_idx]
+    print(f"[{tag}] {len(sequences)} sequences in this shard", flush=True)
 
-    if not sequences:
-        print("Nothing to do.", flush=True)
-        return
+    print(f"[{tag}] Phase 1: Listing images in all sequences ({args.list_workers} threads)...", flush=True)
+    t0 = time.time()
+    all_images = []  # [(seq_id, img_id), ...]
+    done = 0
 
-    # Result queue for processed images
-    result_queue = Queue(maxsize=args.batch_size * 2)
-    counter = {"submitted": 0, "errors": 0}
-
-    batch_records = []
-    batch_embeddings = []
-    t_start = time.time()
-    t_last_log = t_start
-
-    # Use a single thread pool for both listing and downloading.
-    # Submit sequence listings (which internally submit downloads).
-    pool = ThreadPoolExecutor(max_workers=args.workers)
-
-    # Submit all sequence listings — they'll run concurrently and
-    # internally submit download tasks as images are discovered.
-    listing_futures = []
-    for seq_id in sequences:
-        fut = pool.submit(
-            list_and_submit_images,
-            seq_id, pool, args.skip_embeddings, result_queue, counter,
-        )
-        listing_futures.append(fut)
-
-    print(f"[{shard_tag}] Submitted {len(listing_futures)} sequence listings", flush=True)
-
-    # Collect results from the queue
-    done_listings = 0
-    all_listings_done = False
-
-    while True:
-        # Check if all listing futures are done
-        if not all_listings_done:
-            done_count = sum(1 for f in listing_futures if f.done())
-            if done_count == len(listing_futures):
-                all_listings_done = True
+    with ThreadPoolExecutor(max_workers=args.list_workers) as pool:
+        futures = {pool.submit(list_images_in_sequence, seq): seq for seq in sequences}
+        for fut in as_completed(futures):
+            try:
+                seq_id, images = fut.result()
+                for img_id in images:
+                    all_images.append((seq_id, img_id))
+            except Exception as e:
+                print(f"[{tag}] WARN: listing failed: {e}", flush=True)
+            done += 1
+            if done % 1000 == 0:
                 print(
-                    f"[{shard_tag}] All {len(listing_futures)} sequence listings complete, "
-                    f"draining downloads...",
+                    f"[{tag}]   Listed {done}/{len(sequences)} sequences, "
+                    f"{len(all_images):,} images so far ({time.time()-t0:.0f}s)",
                     flush=True,
                 )
 
-        # Drain the result queue
-        got_any = False
-        while True:
+    listing_time = time.time() - t0
+    print(
+        f"[{tag}] Phase 1 done: {len(all_images):,} images across "
+        f"{len(sequences)} sequences ({listing_time:.0f}s)",
+        flush=True,
+    )
+
+    if not all_images:
+        print(f"[{tag}] No images found.", flush=True)
+        return
+
+    # ── Phase 2: Download all images ────────────────────────────
+    print(
+        f"[{tag}] Phase 2: Downloading {len(all_images):,} images "
+        f"({args.download_workers} threads)...",
+        flush=True,
+    )
+    t_start = time.time()
+    batch_records = []
+    batch_embeddings = []
+    completed = 0
+    errors = 0
+    t_last_log = t_start
+
+    with ThreadPoolExecutor(max_workers=args.download_workers) as pool:
+        futures = {
+            pool.submit(download_one_image, seq_id, img_id, args.skip_embeddings): (seq_id, img_id)
+            for seq_id, img_id in all_images
+        }
+
+        for fut in as_completed(futures):
+            completed += 1
             try:
-                result = result_queue.get(timeout=0.5)
-                got_any = True
-            except Empty:
-                break
+                result = fut.result()
+            except Exception:
+                errors += 1
+                continue
+
+            if result is None:
+                continue
 
             record, embedding = result
             batch_records.append(record)
             if embedding is not None:
                 batch_embeddings.append(embedding)
 
-            # Flush batch if full
+            # Flush batch
             if len(batch_records) >= args.batch_size:
                 n = flush_batch(
                     batch_records, batch_embeddings, batch_num,
-                    output_dir, args.skip_embeddings, shard_tag,
+                    output_dir, args.skip_embeddings, tag,
                 )
                 total_images += n
                 elapsed = time.time() - t_start
                 rate = total_images / elapsed if elapsed > 0 else 0
+                pct = completed / len(all_images) * 100
                 print(
-                    f"[{shard_tag}] Batch {batch_num}: {n:,} images | "
+                    f"[{tag}] Batch {batch_num}: {n:,} images | "
                     f"Total: {total_images:,} | "
+                    f"{completed:,}/{len(all_images):,} ({pct:.1f}%) | "
                     f"{rate:.0f} img/s | {elapsed:.0f}s",
                     flush=True,
                 )
                 batch_records = []
                 batch_embeddings = []
                 batch_num += 1
+                with open(ckpt_path, "w") as f:
+                    json.dump({"next_batch_num": batch_num, "total_images": total_images}, f)
 
-                ckpt_seq = start_seq_idx + done_count if not all_listings_done else len(sequences)
-                with open(checkpoint_path, "w") as f:
-                    json.dump({
-                        "next_sequence_idx": ckpt_seq,
-                        "next_batch_num": batch_num,
-                        "total_images": total_images,
-                    }, f)
+            # Progress log every 30 seconds
+            now = time.time()
+            if now - t_last_log >= 30:
+                elapsed = now - t_start
+                effective = total_images + len(batch_records)
+                rate = effective / elapsed if elapsed > 0 else 0
+                pct = completed / len(all_images) * 100
+                est_remaining = (len(all_images) - completed) / (completed / elapsed) if completed > 0 else 0
+                print(
+                    f"[{tag}] {effective:,} images ({len(batch_records):,} pending) | "
+                    f"{completed:,}/{len(all_images):,} ({pct:.1f}%) | "
+                    f"~{rate:.0f} img/s | "
+                    f"errors: {errors} | "
+                    f"ETA: {est_remaining/3600:.1f}h | {elapsed:.0f}s",
+                    flush=True,
+                )
+                t_last_log = now
 
-        # Progress logging every 30 seconds
-        now = time.time()
-        if now - t_last_log >= 30:
-            pending = len(batch_records)
-            elapsed = now - t_start
-            effective = total_images + pending
-            rate = effective / elapsed if elapsed > 0 else 0
-            print(
-                f"[{shard_tag}] Progress: {effective:,} images "
-                f"({pending:,} pending) | "
-                f"~{rate:.0f} img/s | "
-                f"errors: {counter['errors']} | "
-                f"{elapsed:.0f}s",
-                flush=True,
-            )
-            t_last_log = now
-
-        # Exit condition: all listings done AND queue is empty AND no pending downloads
-        if all_listings_done and result_queue.empty() and not got_any:
-            # Wait a bit more for stragglers
-            time.sleep(2)
-            if result_queue.empty():
-                break
-
-    pool.shutdown(wait=True)
-
-    # Flush remaining
+    # Final flush
     if batch_records:
         n = flush_batch(
             batch_records, batch_embeddings, batch_num,
-            output_dir, args.skip_embeddings, shard_tag,
+            output_dir, args.skip_embeddings, tag,
         )
         total_images += n
         batch_num += 1
 
-    with open(checkpoint_path, "w") as f:
-        json.dump({
-            "next_sequence_idx": start_seq_idx + len(sequences),
-            "next_batch_num": batch_num,
-            "total_images": total_images,
-        }, f)
+    with open(ckpt_path, "w") as f:
+        json.dump({"next_batch_num": batch_num, "total_images": total_images}, f)
 
     elapsed = time.time() - t_start
-    print(f"\n[{shard_tag}] Done in {elapsed:.0f}s", flush=True)
-    print(f"  Total images: {total_images:,}", flush=True)
+    print(f"\n[{tag}] Done in {elapsed:.0f}s ({elapsed/3600:.1f}h)", flush=True)
+    print(f"  Images extracted: {total_images:,}", flush=True)
     print(f"  Batches: {batch_num}", flush=True)
-    print(f"  Errors: {counter['errors']}", flush=True)
+    print(f"  Errors: {errors}", flush=True)
     print(f"  Rate: {total_images / elapsed:.0f} img/s", flush=True)
 
 
