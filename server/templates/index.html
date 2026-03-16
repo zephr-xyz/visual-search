@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visual Search — Geographic Prevalence</title>
+<script src="https://unpkg.com/maplibre-gl@4.1.2/dist/maplibre-gl.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.1.2/dist/maplibre-gl.css">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+
+#map { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
+
+#controls {
+    position: absolute; top: 12px; left: 12px; z-index: 10;
+    background: white; border-radius: 8px; padding: 16px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    width: 340px; max-height: calc(100vh - 24px); overflow-y: auto;
+}
+
+h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
+
+.search-row {
+    display: flex; gap: 8px; margin-bottom: 12px;
+}
+#query {
+    flex: 1; padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px;
+    font-size: 14px; outline: none;
+}
+#query:focus { border-color: #4a90d9; }
+#search-btn {
+    padding: 8px 16px; background: #4a90d9; color: white;
+    border: none; border-radius: 6px; cursor: pointer; font-size: 14px;
+    white-space: nowrap;
+}
+#search-btn:hover { background: #3a7bc8; }
+#search-btn:disabled { background: #ccc; cursor: not-allowed; }
+
+.options-row {
+    display: flex; gap: 12px; margin-bottom: 12px; font-size: 13px;
+}
+.option-group { display: flex; gap: 4px; align-items: center; }
+.option-group label { color: #666; margin-right: 4px; }
+.option-group select {
+    padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px;
+    font-size: 13px; background: white;
+}
+
+#status {
+    font-size: 12px; color: #888; margin-bottom: 8px;
+    min-height: 16px;
+}
+
+#results-list {
+    max-height: 400px; overflow-y: auto;
+}
+.result-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px;
+}
+.result-row:last-child { border-bottom: none; }
+.result-name { color: #333; flex: 1; }
+.result-bar {
+    width: 80px; height: 14px; background: #f0f0f0; border-radius: 3px;
+    margin: 0 8px; overflow: hidden;
+}
+.result-bar-fill {
+    height: 100%; background: #4a90d9; border-radius: 3px;
+    transition: width 0.3s ease;
+}
+.result-pct { font-size: 12px; color: #666; width: 50px; text-align: right; }
+
+#legend {
+    position: absolute; bottom: 30px; right: 12px; z-index: 10;
+    background: white; border-radius: 8px; padding: 12px 16px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.15); font-size: 12px;
+}
+#legend h3 { font-size: 13px; margin-bottom: 8px; color: #333; }
+.legend-scale {
+    display: flex; height: 14px; border-radius: 3px; overflow: hidden;
+    width: 180px; margin-bottom: 4px;
+}
+.legend-labels { display: flex; justify-content: space-between; width: 180px; }
+.legend-labels span { color: #666; }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="controls">
+    <h1>Visual Search</h1>
+    <div class="search-row">
+        <input id="query" type="text" placeholder="e.g. trash, graffiti, solar panels..." autofocus>
+        <button id="search-btn" onclick="doSearch()">Search</button>
+    </div>
+    <div class="options-row">
+        <div class="option-group">
+            <label>Mode:</label>
+            <select id="mode">
+                <option value="keyword">Keyword</option>
+                <option value="semantic">Semantic</option>
+            </select>
+        </div>
+        <div class="option-group">
+            <label>Level:</label>
+            <select id="geo-level">
+                <option value="state">State</option>
+                <option value="msa">MSA</option>
+            </select>
+        </div>
+    </div>
+    <div id="status">Enter a search term to see geographic prevalence.</div>
+    <div id="results-list"></div>
+</div>
+
+<div id="legend" style="display:none;">
+    <h3>Prevalence</h3>
+    <div class="legend-scale" id="legend-scale"></div>
+    <div class="legend-labels">
+        <span id="legend-min">0%</span>
+        <span id="legend-max">—</span>
+    </div>
+</div>
+
+<script>
+const COLORS = [
+    [240, 249, 232],  // very low — light green
+    [186, 228, 179],
+    [116, 196, 118],
+    [49, 163, 84],
+    [0, 109, 44],     // high — dark green
+];
+
+let map;
+let currentResults = null;
+let stateGeojson = null;
+let msaGeojson = null;
+
+// ── Map initialization ──────────────────────────────────────
+
+function initMap() {
+    map = new maplibregl.Map({
+        container: 'map',
+        style: {
+            version: 8,
+            sources: {
+                'carto': {
+                    type: 'raster',
+                    tiles: ['https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png'],
+                    tileSize: 256,
+                    attribution: '&copy; CARTO'
+                }
+            },
+            layers: [{
+                id: 'carto-tiles',
+                type: 'raster',
+                source: 'carto',
+                minzoom: 0,
+                maxzoom: 19
+            }]
+        },
+        center: [-98.5, 39.8],
+        zoom: 4
+    });
+
+    map.on('load', () => {
+        // Add empty sources for choropleth
+        map.addSource('choropleth', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+        });
+
+        map.addLayer({
+            id: 'choropleth-fill',
+            type: 'fill',
+            source: 'choropleth',
+            paint: {
+                'fill-color': ['get', 'fill_color'],
+                'fill-opacity': 0.65
+            }
+        });
+
+        map.addLayer({
+            id: 'choropleth-outline',
+            type: 'line',
+            source: 'choropleth',
+            paint: {
+                'line-color': '#333',
+                'line-width': 0.5,
+                'line-opacity': 0.4
+            }
+        });
+
+        // Hover popup
+        const popup = new maplibregl.Popup({
+            closeButton: false, closeOnClick: false
+        });
+
+        map.on('mousemove', 'choropleth-fill', (e) => {
+            map.getCanvas().style.cursor = 'pointer';
+            const props = e.features[0].properties;
+            const html = `<strong>${props.geo_name}</strong><br>
+                Prevalence: ${(props.prevalence * 100).toFixed(3)}%<br>
+                ${props.count.toLocaleString()} / ${props.total_images.toLocaleString()} images`;
+            popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+        });
+
+        map.on('mouseleave', 'choropleth-fill', () => {
+            map.getCanvas().style.cursor = '';
+            popup.remove();
+        });
+
+        // Load GeoJSON boundaries
+        loadBoundaries();
+    });
+}
+
+async function loadBoundaries() {
+    try {
+        const [stateResp, msaResp] = await Promise.allSettled([
+            fetch('/api/geojson/state').then(r => r.ok ? r.json() : null),
+            fetch('/api/geojson/msa').then(r => r.ok ? r.json() : null),
+        ]);
+        stateGeojson = stateResp.status === 'fulfilled' ? stateResp.value : null;
+        msaGeojson = msaResp.status === 'fulfilled' ? msaResp.value : null;
+    } catch (e) {
+        console.warn('Failed to load boundaries:', e);
+    }
+}
+
+// ── Search ──────────────────────────────────────────────────
+
+async function doSearch() {
+    const query = document.getElementById('query').value.trim();
+    if (!query) return;
+
+    const mode = document.getElementById('mode').value;
+    const geoLevel = document.getElementById('geo-level').value;
+    const btn = document.getElementById('search-btn');
+    const status = document.getElementById('status');
+
+    btn.disabled = true;
+    status.textContent = 'Searching...';
+
+    try {
+        const resp = await fetch('/api/search', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                query: query,
+                mode: mode,
+                geo_level: geoLevel,
+                top_k: 100000,
+            }),
+        });
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || resp.statusText);
+        }
+
+        const data = await resp.json();
+        currentResults = data.results;
+
+        status.textContent = `${data.results.length} geographies | ${data.elapsed_ms.toFixed(0)}ms | ${mode}`;
+        renderResults(data.results);
+        renderChoropleth(data.results, geoLevel);
+
+    } catch (e) {
+        status.textContent = `Error: ${e.message}`;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+// ── Results list ────────────────────────────────────────────
+
+function renderResults(results) {
+    const container = document.getElementById('results-list');
+    if (!results.length) {
+        container.innerHTML = '<div style="color:#999; font-size:13px; padding:8px 0;">No results found.</div>';
+        return;
+    }
+
+    const maxPrev = Math.max(...results.map(r => r.prevalence));
+    container.innerHTML = results.slice(0, 50).map(r => {
+        const pct = (r.prevalence * 100);
+        const barWidth = maxPrev > 0 ? (r.prevalence / maxPrev * 100) : 0;
+        return `
+            <div class="result-row">
+                <span class="result-name">${r.geo_name}</span>
+                <div class="result-bar">
+                    <div class="result-bar-fill" style="width:${barWidth}%"></div>
+                </div>
+                <span class="result-pct">${pct < 0.01 ? pct.toFixed(4) : pct.toFixed(2)}%</span>
+            </div>
+        `;
+    }).join('');
+}
+
+// ── Choropleth ──────────────────────────────────────────────
+
+function renderChoropleth(results, geoLevel) {
+    const geojson = geoLevel === 'state' ? stateGeojson : msaGeojson;
+    if (!geojson || !results.length) {
+        document.getElementById('legend').style.display = 'none';
+        return;
+    }
+
+    // Build lookup: geo_name -> result
+    const lookup = {};
+    for (const r of results) {
+        lookup[r.geo_name] = r;
+    }
+
+    const maxPrev = Math.max(...results.map(r => r.prevalence));
+
+    // Property name in GeoJSON for matching
+    const nameKey = geoLevel === 'state' ? 'NAME' : 'NAME';
+
+    // Assign colors to features
+    const colored = {
+        type: 'FeatureCollection',
+        features: geojson.features.map(f => {
+            const name = f.properties[nameKey];
+            const match = lookup[name];
+            let color = 'rgba(200,200,200,0.3)';
+            let prevalence = 0;
+            let count = 0;
+            let total = 0;
+
+            if (match && maxPrev > 0) {
+                const t = match.prevalence / maxPrev;
+                const ci = Math.min(Math.floor(t * (COLORS.length - 1)), COLORS.length - 2);
+                const frac = t * (COLORS.length - 1) - ci;
+                const c0 = COLORS[ci];
+                const c1 = COLORS[ci + 1];
+                const r = Math.round(c0[0] + (c1[0] - c0[0]) * frac);
+                const g = Math.round(c0[1] + (c1[1] - c0[1]) * frac);
+                const b = Math.round(c0[2] + (c1[2] - c0[2]) * frac);
+                color = `rgb(${r},${g},${b})`;
+                prevalence = match.prevalence;
+                count = match.count;
+                total = match.total_images;
+            }
+
+            return {
+                ...f,
+                properties: {
+                    ...f.properties,
+                    geo_name: name,
+                    fill_color: color,
+                    prevalence: prevalence,
+                    count: count,
+                    total_images: total,
+                }
+            };
+        })
+    };
+
+    map.getSource('choropleth').setData(colored);
+
+    // Update legend
+    const legend = document.getElementById('legend');
+    legend.style.display = 'block';
+    document.getElementById('legend-max').textContent = (maxPrev * 100).toFixed(2) + '%';
+
+    const scale = document.getElementById('legend-scale');
+    scale.innerHTML = COLORS.map((c, i) => {
+        const w = 100 / COLORS.length;
+        return `<div style="width:${w}%;background:rgb(${c[0]},${c[1]},${c[2]})"></div>`;
+    }).join('');
+}
+
+// ── Keyboard shortcut ───────────────────────────────────────
+
+document.getElementById('query').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') doSearch();
+});
+
+// ── Init ────────────────────────────────────────────────────
+
+initMap();
+</script>
+</body>
+</html>
