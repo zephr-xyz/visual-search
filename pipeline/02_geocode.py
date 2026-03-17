@@ -133,104 +133,128 @@ def load_boundaries():
     return states, cbsa
 
 
-def load_extracts(limit=None):
-    """Load all extracted metadata parquet files."""
+def geocode_file(parquet_path, states_gdf, cbsa_gdf, output_path):
+    """Geocode a single parquet file and write result to output_path.
+
+    Loads only the columns needed for geocoding (no captions) to minimize
+    memory usage. Captions are joined back from the original file at the end.
+    """
+    # Load lightweight columns for spatial join
+    geo_cols = ["image_id", "sequence_id", "lat", "lng"]
+    df_geo = pd.read_parquet(parquet_path, columns=geo_cols)
+
+    # Compute tile coordinates
+    lats = df_geo["lat"].values.astype(np.float64)
+    lngs = df_geo["lng"].values.astype(np.float64)
+    for zoom in (8, 10, 12, 14):
+        df_geo[f"z{zoom}_tile"] = compute_tile_keys(lats, lngs, zoom)
+
+    # Spatial join with states
+    geometry = gpd.points_from_xy(df_geo["lng"], df_geo["lat"])
+    gdf = gpd.GeoDataFrame(df_geo, geometry=geometry, crs="EPSG:4326")
+    del df_geo
+
+    gdf_states = gpd.sjoin(gdf, states_gdf, how="left", predicate="within")
+    gdf_states = gdf_states.drop(columns=["index_right"], errors="ignore")
+
+    # Spatial join with CBSAs
+    gdf_cbsa = gpd.sjoin(gdf, cbsa_gdf, how="left", predicate="within")
+    gdf_cbsa = gdf_cbsa[["image_id", "cbsa_id", "cbsa_name"]].drop_duplicates(
+        subset=["image_id"], keep="first"
+    )
+    del gdf
+
+    # Merge state + CBSA results
+    result = pd.DataFrame(gdf_states.drop(columns=["geometry"]))
+    result = result.merge(gdf_cbsa, on="image_id", how="left")
+    del gdf_states, gdf_cbsa
+
+    # Join back captions and other columns from original file
+    extra_cols = ["image_id", "caption", "captured_at", "compass_angle",
+                  "camera_type", "is_pano"]
+    available = pd.read_parquet(parquet_path, columns=["image_id"]).columns.tolist()
+    # Read available extra columns
+    import pyarrow.parquet as pq
+    schema_cols = pq.read_schema(parquet_path).names
+    load_extra = [c for c in extra_cols if c in schema_cols]
+    df_extra = pd.read_parquet(parquet_path, columns=load_extra)
+    result = result.merge(df_extra, on="image_id", how="left")
+    del df_extra
+
+    result.to_parquet(output_path, index=False)
+    return len(result)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Geocode images to state/MSA")
+    parser.add_argument("--limit", type=int, help="Limit files for testing")
+    args = parser.parse_args()
+
+    states_gdf, cbsa_gdf = load_boundaries()
+
     extract_dir = DATA_DIR / "extracts"
     parquet_files = sorted(extract_dir.glob("meta_*.parquet"))
     if not parquet_files:
         print(f"ERROR: No parquet files found in {extract_dir}")
         raise SystemExit(1)
 
-    print(f"Loading {len(parquet_files)} parquet files...")
-    dfs = []
-    total = 0
-    for pf in parquet_files:
-        df = pd.read_parquet(pf)
-        if limit and total + len(df) > limit:
-            df = df.head(limit - total)
-        dfs.append(df)
-        total += len(df)
-        if limit and total >= limit:
-            break
+    if args.limit:
+        parquet_files = parquet_files[: args.limit]
 
-    combined = pd.concat(dfs, ignore_index=True)
-    print(f"  Loaded {len(combined):,} images")
-    return combined
+    geo_dir = DATA_DIR / "geocoded"
+    geo_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"Geocoding {len(parquet_files)} parquet files...")
+    import time
+    t0 = time.time()
+    total_images = 0
 
-def geocode(df, states_gdf, cbsa_gdf, chunk_size=500_000):
-    """Assign each image to a state and MSA via chunked spatial join.
+    for i, pf in enumerate(parquet_files):
+        out_name = pf.name.replace("meta_", "geo_")
+        out_path = geo_dir / out_name
+        if out_path.exists():
+            n = len(pd.read_parquet(out_path, columns=["image_id"]))
+            total_images += n
+            if (i + 1) % 50 == 0:
+                print(f"  [{i+1}/{len(parquet_files)}] {pf.name} -> skipped (exists, {n:,} rows)", flush=True)
+            continue
 
-    Processes in chunks to avoid OOM on large datasets.
-    """
-    # Compute tile coordinates first (vectorized, low memory)
-    print("Computing tile coordinates...")
-    lats = df["lat"].values.astype(np.float64)
-    lngs = df["lng"].values.astype(np.float64)
-    for zoom in (8, 10, 12, 14):
-        df[f"z{zoom}_tile"] = compute_tile_keys(lats, lngs, zoom)
+        n = geocode_file(pf, states_gdf, cbsa_gdf, out_path)
+        total_images += n
+        elapsed = time.time() - t0
+        if (i + 1) % 10 == 0 or i == 0:
+            print(
+                f"  [{i+1}/{len(parquet_files)}] {pf.name} -> {n:,} rows | "
+                f"total: {total_images:,} | {elapsed:.0f}s",
+                flush=True,
+            )
 
-    n_total = len(df)
-    n_chunks = (n_total + chunk_size - 1) // chunk_size
-    print(f"Geocoding {n_total:,} images in {n_chunks} chunks of {chunk_size:,}...")
+    elapsed = time.time() - t0
+    print(f"\nGeocoded {total_images:,} images in {elapsed:.0f}s ({elapsed/60:.1f}m)")
 
-    results = []
-    for i in range(0, n_total, chunk_size):
-        chunk_num = i // chunk_size + 1
-        chunk = df.iloc[i : i + chunk_size].copy()
-        print(f"  Chunk {chunk_num}/{n_chunks}: {len(chunk):,} images...", flush=True)
-
-        geometry = gpd.points_from_xy(chunk["lng"], chunk["lat"])
-        gdf = gpd.GeoDataFrame(chunk, geometry=geometry, crs="EPSG:4326")
-
-        # Spatial join with states
-        gdf_states = gpd.sjoin(gdf, states_gdf, how="left", predicate="within")
-        gdf_states = gdf_states.drop(columns=["index_right"], errors="ignore")
-
-        # Spatial join with CBSAs
-        gdf_cbsa = gpd.sjoin(gdf, cbsa_gdf, how="left", predicate="within")
-        gdf_cbsa = gdf_cbsa[["image_id", "cbsa_id", "cbsa_name"]].drop_duplicates(
-            subset=["image_id"], keep="first"
-        )
-
-        # Merge and drop geometry
-        merged = gdf_states.merge(gdf_cbsa, on="image_id", how="left")
-        results.append(pd.DataFrame(merged.drop(columns=["geometry"])))
-
-        # Free memory
-        del gdf, gdf_states, gdf_cbsa, merged
-
-    result = pd.concat(results, ignore_index=True)
-    del results
-
-    n_z10_tiles = result["z10_tile"].nunique()
-    print(f"  Tile coverage: {n_z10_tiles:,} z10 tiles, {result['z14_tile'].nunique():,} z14 tiles")
-
-    # Report coverage
-    in_state = result["state_name"].notna().sum()
-    in_msa = result["cbsa_name"].notna().sum()
-    print(f"  In a US state: {in_state:,} / {len(result):,} ({100*in_state/len(result):.1f}%)")
-    print(f"  In an MSA:     {in_msa:,} / {len(result):,} ({100*in_msa/len(result):.1f}%)")
-
-    return result
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Geocode images to state/MSA")
-    parser.add_argument("--limit", type=int, help="Limit images for testing")
-    args = parser.parse_args()
-
-    states_gdf, cbsa_gdf = load_boundaries()
-    df = load_extracts(limit=args.limit)
-    result = geocode(df, states_gdf, cbsa_gdf)
-
+    # Merge into single output file
+    print("Merging geocoded files...")
+    geo_files = sorted(geo_dir.glob("geo_*.parquet"))
     out_path = DATA_DIR / "image_geography.parquet"
-    result.to_parquet(out_path, index=False)
-    print(f"\nSaved {len(result):,} rows to {out_path}")
 
-    # Summary by state
+    # Stream-merge to avoid loading all into memory at once
+    import pyarrow.parquet as pq
+    writer = None
+    for gf in geo_files:
+        table = pq.read_table(gf)
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, table.schema)
+        writer.write_table(table)
+    if writer:
+        writer.close()
+
+    print(f"Saved {out_path}")
+
+    # Summary by state (read just state column)
+    states = pd.read_parquet(out_path, columns=["state_name"])
+    print(f"\nTotal: {len(states):,} images")
     print("\nTop 10 states by image count:")
-    top = result.groupby("state_name").size().sort_values(ascending=False).head(10)
+    top = states["state_name"].value_counts().head(10)
     for state, count in top.items():
         print(f"  {state:20s} {count:>10,}")
 
