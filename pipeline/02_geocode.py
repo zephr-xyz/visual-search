@@ -158,36 +158,51 @@ def load_extracts(limit=None):
     return combined
 
 
-def geocode(df, states_gdf, cbsa_gdf):
-    """Assign each image to a state and MSA via spatial join."""
-    print("Creating point geometries...")
-    geometry = gpd.points_from_xy(df["lng"], df["lat"])
-    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+def geocode(df, states_gdf, cbsa_gdf, chunk_size=500_000):
+    """Assign each image to a state and MSA via chunked spatial join.
 
-    # Spatial join with states
-    print("Joining with state boundaries...")
-    gdf_states = gpd.sjoin(gdf, states_gdf, how="left", predicate="within")
-    gdf_states = gdf_states.drop(columns=["index_right"], errors="ignore")
-
-    # Spatial join with CBSAs
-    print("Joining with MSA boundaries...")
-    gdf_cbsa = gpd.sjoin(gdf, cbsa_gdf, how="left", predicate="within")
-    gdf_cbsa = gdf_cbsa[["image_id", "cbsa_id", "cbsa_name"]].drop_duplicates(
-        subset=["image_id"], keep="first"
-    )
-
-    # Merge CBSA results back
-    result = gdf_states.merge(gdf_cbsa, on="image_id", how="left")
-
-    # Drop geometry column for parquet output
-    result = pd.DataFrame(result.drop(columns=["geometry"]))
-
-    # Compute tile coordinates at z8, z10, z12, z14
+    Processes in chunks to avoid OOM on large datasets.
+    """
+    # Compute tile coordinates first (vectorized, low memory)
     print("Computing tile coordinates...")
-    lats = result["lat"].values.astype(np.float64)
-    lngs = result["lng"].values.astype(np.float64)
+    lats = df["lat"].values.astype(np.float64)
+    lngs = df["lng"].values.astype(np.float64)
     for zoom in (8, 10, 12, 14):
-        result[f"z{zoom}_tile"] = compute_tile_keys(lats, lngs, zoom)
+        df[f"z{zoom}_tile"] = compute_tile_keys(lats, lngs, zoom)
+
+    n_total = len(df)
+    n_chunks = (n_total + chunk_size - 1) // chunk_size
+    print(f"Geocoding {n_total:,} images in {n_chunks} chunks of {chunk_size:,}...")
+
+    results = []
+    for i in range(0, n_total, chunk_size):
+        chunk_num = i // chunk_size + 1
+        chunk = df.iloc[i : i + chunk_size].copy()
+        print(f"  Chunk {chunk_num}/{n_chunks}: {len(chunk):,} images...", flush=True)
+
+        geometry = gpd.points_from_xy(chunk["lng"], chunk["lat"])
+        gdf = gpd.GeoDataFrame(chunk, geometry=geometry, crs="EPSG:4326")
+
+        # Spatial join with states
+        gdf_states = gpd.sjoin(gdf, states_gdf, how="left", predicate="within")
+        gdf_states = gdf_states.drop(columns=["index_right"], errors="ignore")
+
+        # Spatial join with CBSAs
+        gdf_cbsa = gpd.sjoin(gdf, cbsa_gdf, how="left", predicate="within")
+        gdf_cbsa = gdf_cbsa[["image_id", "cbsa_id", "cbsa_name"]].drop_duplicates(
+            subset=["image_id"], keep="first"
+        )
+
+        # Merge and drop geometry
+        merged = gdf_states.merge(gdf_cbsa, on="image_id", how="left")
+        results.append(pd.DataFrame(merged.drop(columns=["geometry"])))
+
+        # Free memory
+        del gdf, gdf_states, gdf_cbsa, merged
+
+    result = pd.concat(results, ignore_index=True)
+    del results
+
     n_z10_tiles = result["z10_tile"].nunique()
     print(f"  Tile coverage: {n_z10_tiles:,} z10 tiles, {result['z14_tile'].nunique():,} z14 tiles")
 
