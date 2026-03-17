@@ -159,7 +159,19 @@ def main():
         ckpt = json.loads(ckpt_path.read_text())
         batch_num = ckpt["next_batch_num"]
         total_images = ckpt["total_images"]
-        print(f"[{tag}] Resuming: batch={batch_num}, images={total_images}", flush=True)
+        # Load image IDs from existing parquet files to skip re-downloading
+        existing_files = sorted(output_dir.glob(f"meta_{tag}_*.parquet"))
+        for pf in existing_files:
+            try:
+                edf = pd.read_parquet(pf, columns=["image_id"])
+                skip_images.update(edf["image_id"].tolist())
+            except Exception:
+                pass
+        print(
+            f"[{tag}] Resuming: batch={batch_num}, images={total_images}, "
+            f"skipping {len(skip_images):,} already-extracted image IDs",
+            flush=True,
+        )
 
     s3 = init_s3(args.download_workers)
 
@@ -207,6 +219,16 @@ def main():
     if not all_images:
         print(f"[{tag}] No images found.", flush=True)
         return
+
+    # Filter out already-extracted images on resume
+    if skip_images:
+        before = len(all_images)
+        all_images = [(s, i) for s, i in all_images if i not in skip_images]
+        print(
+            f"[{tag}] Filtered: {before:,} -> {len(all_images):,} images "
+            f"({before - len(all_images):,} already extracted)",
+            flush=True,
+        )
 
     # ── Phase 2: Download images in chunks ─────────────────────
     CHUNK = 10_000  # Process this many images at a time to limit memory
