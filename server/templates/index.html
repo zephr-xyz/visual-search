@@ -541,17 +541,17 @@ function renderResults(results, geoLevel) {
         const barWidth = maxScore > 0 ? (Math.abs(score) / maxScore * 100) : 0;
         const barColor = score >= 0 ? '#4a90d9' : '#d94a4a';
         const chi = r.signed_chi != null ? r.signed_chi : 0;
-        const chiLabel = chi >= 0 ? `+${chi.toFixed(1)}` : chi.toFixed(1);
-        const tfidf = r.tfidf_score != null ? r.tfidf_score.toFixed(3) : '';
-        const pct = (r.prevalence * 100);
-        const prevLabel = pct < 0.01 ? pct.toFixed(4) : pct.toFixed(2);
+        const tfidf = r.tfidf_score != null ? r.tfidf_score : 0;
+        const count = r.count || 0;
+        const total = r.total_images || 0;
+        const scoreLabel = score >= 0 ? `+${score.toFixed(2)}` : score.toFixed(2);
         return `
             <div class="result-row" onclick="clickResult(${i}, '${geoLevel}')">
                 <span class="result-name">${r.geo_name}</span>
                 <div class="result-bar">
                     <div class="result-bar-fill" style="width:${barWidth}%; background:${barColor}"></div>
                 </div>
-                <span class="result-pct" title="Chi: ${chiLabel} | TF-IDF: ${tfidf} | Prev: ${prevLabel}%">${chiLabel} &chi;</span>
+                <span class="result-pct" title="${count.toLocaleString()} matches in ${total.toLocaleString()} images | TF-IDF: ${tfidf.toFixed(3)}">${scoreLabel}</span>
             </div>
         `;
     }).join('');
