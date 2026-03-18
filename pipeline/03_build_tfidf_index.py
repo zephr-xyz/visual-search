@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import json
+import multiprocessing as mp
 import pickle
 import re
 import time
@@ -87,30 +88,60 @@ def stem_tokenize(text):
     return [stemmer.stem(t) for t in tokens if t not in STOP_WORDS]
 
 
-def build_keyword_index(df, geo_col):
-    """Build inverted index: stemmed_term -> {geography: image_count}.
-
-    Also returns per-geography total image counts.
-    """
-    print(f"  Building keyword index for {geo_col}...")
-    t0 = time.time()
-
-    # term -> geo -> count
-    index = defaultdict(lambda: defaultdict(int))
-    geo_totals = defaultdict(int)
-
-    for geo_name, caption in zip(df[geo_col], df["caption"]):
+def _tokenize_chunk(args):
+    """Tokenize a chunk of (geo_name, caption) pairs. Used by multiprocessing."""
+    chunk_geos, chunk_captions = args
+    local_index = defaultdict(lambda: defaultdict(int))
+    local_totals = defaultdict(int)
+    for geo_name, caption in zip(chunk_geos, chunk_captions):
         if pd.isna(geo_name) or not caption:
             continue
-        geo_totals[geo_name] += 1
-        # Deduplicate tokens per image (presence, not frequency)
+        local_totals[geo_name] += 1
         seen = set()
         for token in stem_tokenize(caption):
             if token not in seen:
-                index[token][geo_name] += 1
+                local_index[token][geo_name] += 1
                 seen.add(token)
+    return dict(local_index), dict(local_totals)
 
-    # Convert to regular dicts for pickling
+
+def build_keyword_index(df, geo_col, n_workers=None):
+    """Build inverted index: stemmed_term -> {geography: image_count}.
+
+    Uses multiprocessing to parallelize stemming across CPU cores.
+    Also returns per-geography total image counts.
+    """
+    if n_workers is None:
+        n_workers = min(mp.cpu_count(), 8)
+
+    print(f"  Building keyword index for {geo_col} ({n_workers} workers)...")
+    t0 = time.time()
+
+    # Prepare data as lists
+    geos = df[geo_col].tolist()
+    captions = df["caption"].tolist()
+    n = len(geos)
+
+    # Split into chunks for parallel processing
+    chunk_size = max(1, n // n_workers)
+    chunks = []
+    for i in range(0, n, chunk_size):
+        chunks.append((geos[i:i + chunk_size], captions[i:i + chunk_size]))
+
+    # Process in parallel
+    with mp.Pool(n_workers) as pool:
+        results = pool.map(_tokenize_chunk, chunks)
+
+    # Merge results
+    index = defaultdict(lambda: defaultdict(int))
+    geo_totals = defaultdict(int)
+    for chunk_index, chunk_totals in results:
+        for term, geo_counts in chunk_index.items():
+            for geo, count in geo_counts.items():
+                index[term][geo] += count
+        for geo, count in chunk_totals.items():
+            geo_totals[geo] += count
+
     index = {term: dict(geos) for term, geos in index.items()}
     geo_totals = dict(geo_totals)
 
@@ -119,13 +150,21 @@ def build_keyword_index(df, geo_col):
     return index, geo_totals
 
 
-def build_tfidf_matrix(df, geo_col):
+def _stem_doc(text):
+    """Stem a single concatenated document. Used by multiprocessing."""
+    return " ".join(stem_tokenize(text))
+
+
+def build_tfidf_matrix(df, geo_col, n_workers=None):
     """Build TF-IDF matrix where each row is a geography.
 
     Concatenates all captions in each geography into one document,
     then fits a TfidfVectorizer with stemming and bigrams.
     """
-    print(f"  Building TF-IDF matrix for {geo_col}...")
+    if n_workers is None:
+        n_workers = min(mp.cpu_count(), 8)
+
+    print(f"  Building TF-IDF matrix for {geo_col} ({n_workers} workers)...")
     t0 = time.time()
 
     # Concatenate captions per geography
@@ -138,8 +177,13 @@ def build_tfidf_matrix(df, geo_col):
         geo_docs[geo_name].append(caption)
 
     geo_names = sorted(geo_docs.keys())
-    # Pre-stem documents so vectorizer uses default (picklable) tokenizer
-    documents = [" ".join(stem_tokenize(" ".join(geo_docs[g]))) for g in geo_names]
+    raw_docs = [" ".join(geo_docs[g]) for g in geo_names]
+
+    # Pre-stem documents in parallel
+    print(f"    Pre-stemming {len(geo_names)} documents...", flush=True)
+    with mp.Pool(n_workers) as pool:
+        documents = pool.map(_stem_doc, raw_docs)
+    del raw_docs
 
     vectorizer = TfidfVectorizer(
         token_pattern=r"[a-z]{2,}",  # match pre-stemmed tokens
