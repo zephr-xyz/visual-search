@@ -105,61 +105,116 @@ def _tokenize_chunk(args):
     return dict(local_index), dict(local_totals)
 
 
-def build_keyword_index_chunked(geo_path, geo_col, batch_size=500_000, n_workers=None):
-    """Build inverted index: stemmed_term -> {geography: image_count}.
+def _tokenize_chunk_multi(args):
+    """Tokenize a chunk for multiple geo columns simultaneously."""
+    chunk_data, geo_cols = args
+    # chunk_data is a list of tuples: (caption, geo_val_1, geo_val_2, ...)
+    results = {}
+    for col in geo_cols:
+        results[col] = {
+            "index": defaultdict(lambda: defaultdict(int)),
+            "totals": defaultdict(int),
+        }
 
-    Reads data in chunks via PyArrow to avoid loading all 14M captions at once.
-    Each chunk is processed with multiprocessing, then results are merged.
+    for row in chunk_data:
+        caption = row[0]
+        if not caption:
+            continue
+        tokens = None  # Lazy stem — only compute once
+        for i, col in enumerate(geo_cols):
+            geo_val = row[1 + i]
+            if pd.isna(geo_val):
+                continue
+            results[col]["totals"][geo_val] += 1
+            if tokens is None:
+                tokens = set(stem_tokenize(caption))
+            for token in tokens:
+                results[col]["index"][token][geo_val] += 1
+
+    # Convert defaultdicts to regular dicts for pickling
+    out = {}
+    for col in geo_cols:
+        out[col] = (
+            {t: dict(g) for t, g in results[col]["index"].items()},
+            dict(results[col]["totals"]),
+        )
+    return out
+
+
+def build_keyword_indexes_multi(geo_path, geo_cols_map, batch_size=500_000, n_workers=None):
+    """Build keyword indexes for multiple geo levels in a single pass.
+
+    geo_cols_map: dict of {level_name: column_name}, e.g. {"state": "state_name", ...}
+
+    Returns dict of {level_name: (kw_index, geo_totals)}.
     """
     if n_workers is None:
         n_workers = min(mp.cpu_count(), 8)
 
     import pyarrow.parquet as pq
 
-    print(f"  Building keyword index for {geo_col} ({n_workers} workers)...")
+    geo_cols = list(geo_cols_map.values())
+    level_names = list(geo_cols_map.keys())
+
+    print(f"  Building keyword indexes for {', '.join(level_names)} ({n_workers} workers)...")
     t0 = time.time()
 
-    index = defaultdict(lambda: defaultdict(int))
-    geo_totals = defaultdict(int)
+    # Per-level accumulators
+    indexes = {col: defaultdict(lambda: defaultdict(int)) for col in geo_cols}
+    totals = {col: defaultdict(int) for col in geo_cols}
     total_rows = 0
 
     pf = pq.ParquetFile(geo_path)
-    for batch_i, batch in enumerate(pf.iter_batches(batch_size=batch_size, columns=[geo_col, "caption"])):
+    load_cols = ["caption"] + geo_cols
+    for batch_i, batch in enumerate(pf.iter_batches(batch_size=batch_size, columns=load_cols)):
         df_chunk = batch.to_pandas()
-        geos = df_chunk[geo_col].tolist()
-        captions = df_chunk["caption"].tolist()
-        n = len(geos)
+        n = len(df_chunk)
         total_rows += n
+
+        # Build list of tuples: (caption, geo_val_1, geo_val_2, ...)
+        chunk_data = list(zip(
+            df_chunk["caption"].tolist(),
+            *[df_chunk[col].tolist() for col in geo_cols]
+        ))
         del df_chunk
 
-        # Split into sub-chunks for parallel processing
+        # Split for parallel processing
         sub_size = max(1, n // n_workers)
         chunks = []
         for i in range(0, n, sub_size):
-            chunks.append((geos[i:i + sub_size], captions[i:i + sub_size]))
-        del geos, captions
+            chunks.append((chunk_data[i:i + sub_size], geo_cols))
+        del chunk_data
 
         with mp.Pool(n_workers) as pool:
-            results = pool.map(_tokenize_chunk, chunks)
+            results = pool.map(_tokenize_chunk_multi, chunks)
         del chunks
 
-        for chunk_index, chunk_totals in results:
-            for term, geo_counts in chunk_index.items():
-                for geo, count in geo_counts.items():
-                    index[term][geo] += count
-            for geo, count in chunk_totals.items():
-                geo_totals[geo] += count
+        # Merge results
+        for worker_result in results:
+            for col in geo_cols:
+                chunk_idx, chunk_tot = worker_result[col]
+                for term, geo_counts in chunk_idx.items():
+                    for geo, count in geo_counts.items():
+                        indexes[col][term][geo] += count
+                for geo, count in chunk_tot.items():
+                    totals[col][geo] += count
         del results
 
         if (batch_i + 1) % 5 == 0:
             print(f"    batch {batch_i+1}: {total_rows:,} rows processed", flush=True)
 
-    index = {term: dict(geos) for term, geos in index.items()}
-    geo_totals = dict(geo_totals)
-
     elapsed = time.time() - t0
-    print(f"    {len(index):,} unique terms, {len(geo_totals)} geographies ({elapsed:.1f}s)")
-    return index, geo_totals
+    print(f"    Done in {elapsed:.1f}s ({total_rows:,} rows)")
+
+    # Package results per level
+    output = {}
+    for level_name, col in zip(level_names, geo_cols):
+        idx = {term: dict(geos) for term, geos in indexes[col].items()}
+        tot = dict(totals[col])
+        print(f"    {level_name}: {len(idx):,} terms, {len(tot)} geographies")
+        output[level_name] = (idx, tot)
+
+    return output
 
 
 def _stem_doc(text):
@@ -330,16 +385,23 @@ def main():
     else:
         levels = [(args.geo_level, all_levels[args.geo_level])]
 
-    for level_name, geo_col in levels:
-        if geo_col not in available_cols:
-            print(f"\n=== {level_name.upper()} level === SKIPPED (column {geo_col} not found)")
-            continue
+    # Filter to levels that have columns in the data
+    active_levels = {name: col for name, col in levels if col in available_cols}
+    skipped = [name for name, col in levels if col not in available_cols]
+    for name in skipped:
+        print(f"\n=== {name.upper()} level === SKIPPED (column not found)")
+
+    # Single pass: build all keyword indexes simultaneously
+    print(f"\n=== Building keyword indexes for {', '.join(active_levels.keys())} ===")
+    all_kw = build_keyword_indexes_multi(geo_path, active_levels)
+
+    # Save each level's keyword index and TF-IDF model
+    for level_name in active_levels:
+        kw_index, geo_totals = all_kw[level_name]
 
         print(f"\n=== {level_name.upper()} level ===")
 
-        kw_index, geo_totals = build_keyword_index_chunked(geo_path, geo_col)
-
-        # Save keyword index immediately (before TF-IDF, so it persists on crash)
+        # Save keyword index
         kw_path = DATA_DIR / f"keyword_index_{level_name}.pkl"
         with open(kw_path, "wb") as f:
             pickle.dump({"index": kw_index, "geo_totals": geo_totals}, f)
@@ -350,7 +412,7 @@ def main():
             kw_index, geo_totals
         )
 
-        # Save TF-IDF model (vocabulary dict instead of vectorizer for query-time)
+        # Save TF-IDF model
         tfidf_path = DATA_DIR / f"tfidf_model_{level_name}.pkl"
         with open(tfidf_path, "wb") as f:
             pickle.dump(
@@ -362,9 +424,11 @@ def main():
                 f,
             )
         print(f"  Saved TF-IDF model: {tfidf_path}")
-        del kw_index, vocabulary, tfidf_matrix, geo_names
+        del vocabulary, tfidf_matrix, geo_names
 
         results[level_name] = geo_totals
+
+    del all_kw
 
     # Build per-z10 caption partitions for on-demand z12/z14 queries
     if not args.skip_partitions and "z10_tile" in available_cols:
