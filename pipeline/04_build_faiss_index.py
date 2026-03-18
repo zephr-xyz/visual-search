@@ -66,11 +66,10 @@ def load_training_sample(pairs, sample_size):
     total = 0
     file_sizes = []
     for emb_f, _ in pairs:
-        # Read shape without loading data
-        with open(emb_f, "rb") as f:
-            version = np.lib.format.read_magic(f)
-            shape, _, _ = np.lib.format._read_array_header(f, version)
-        n = shape[0]
+        # Read shape without loading full array into memory
+        emb_mmap = np.load(emb_f, mmap_mode="r")
+        n = emb_mmap.shape[0]
+        del emb_mmap
         file_sizes.append(n)
         total += n
 
