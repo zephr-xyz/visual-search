@@ -122,14 +122,14 @@ def tiles_in_bbox(west, south, east, north, zoom):
     return tiles
 
 
-def load_tile_partition(z10_key):
+def load_tile_partition(z10_key, columns=None):
     """Load a caption partition file for a z10 tile. Returns DataFrame or None."""
     if caption_tile_dir is None:
         return None
     safe_name = z10_key.replace("/", "_")
     path = caption_tile_dir / f"{safe_name}.parquet"
     if path.exists():
-        return pd.read_parquet(path)
+        return pd.read_parquet(path, columns=columns)
     return None
 
 
@@ -693,23 +693,31 @@ def _grid_search_ondemand(tokens, zoom, bbox, parent_tile):
     if len(z10_keys) > 100:
         raise HTTPException(400, f"Query area too large: {len(z10_keys)} z10 tiles. Zoom in further.")
 
+    # Only load columns needed for grid aggregation
+    tile_col = f"z{zoom}_tile"
+    load_cols = ["lat", "lng", "caption"]
+    if tile_col in ("z12_tile", "z14_tile"):
+        load_cols.append(tile_col)
+
     dfs = []
     for z10_key in z10_keys:
-        part_df = load_tile_partition(z10_key)
+        part_df = load_tile_partition(z10_key, columns=load_cols)
         if part_df is not None:
-            dfs.append(part_df)
+            # Apply bbox filter per-partition to reduce concat size
+            if bbox and len(bbox) == 4:
+                west, south, east, north = bbox
+                part_df = part_df[
+                    (part_df["lat"] >= south) & (part_df["lat"] <= north) &
+                    (part_df["lng"] >= west) & (part_df["lng"] <= east)
+                ]
+            if len(part_df) > 0:
+                dfs.append(part_df)
 
     if not dfs:
         return []
 
     df = pd.concat(dfs, ignore_index=True)
 
-    if bbox and len(bbox) == 4:
-        west, south, east, north = bbox
-        df = df[(df["lat"] >= south) & (df["lat"] <= north) &
-                (df["lng"] >= west) & (df["lng"] <= east)]
-
-    tile_col = f"z{zoom}_tile"
     if tile_col not in df.columns:
         lat_rad = np.radians(df["lat"].values)
         n_tiles = 2 ** zoom
