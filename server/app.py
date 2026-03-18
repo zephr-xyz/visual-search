@@ -659,6 +659,19 @@ def _grid_search_precomputed(tokens, zoom, bbox):
     return results
 
 
+def _fast_caption_match(captions, tokens):
+    """Fast vectorized caption matching using regex instead of per-row stemming.
+
+    Builds a regex pattern from query tokens and uses pandas str.contains()
+    which is orders of magnitude faster than calling stem_tokenize() per row.
+    """
+    # Build regex: match any of the original tokens (case-insensitive)
+    # Use word boundaries for precision
+    patterns = [r'\b' + re.escape(t) + r'\w*' for t in tokens]
+    combined = '|'.join(patterns)
+    return captions.str.contains(combined, case=False, na=False, regex=True)
+
+
 def _grid_search_ondemand(tokens, zoom, bbox, parent_tile):
     """On-demand search at z12 or z14 by loading z10 caption partitions."""
     if caption_tile_dir is None:
@@ -706,10 +719,8 @@ def _grid_search_ondemand(tokens, zoom, bbox, parent_tile):
         y = np.clip(y, 0, n_tiles - 1)
         df[tile_col] = [f"z{zoom}/{xi}/{yi}" for xi, yi in zip(x, y)]
 
-    token_set = set(tokens)
-    matches = df["caption"].apply(
-        lambda cap: bool(token_set & set(stem_tokenize(cap))) if pd.notna(cap) else False
-    )
+    # Fast vectorized matching (regex instead of per-row stemming)
+    matches = _fast_caption_match(df["caption"], tokens)
     matched_df = df[matches]
 
     tile_totals = df.groupby(tile_col).size().to_dict()
@@ -779,10 +790,7 @@ def _image_search(tokens, bbox, tile_key, limit):
 
     total_in_area = len(df)
 
-    token_set = set(tokens)
-    matches = df["caption"].apply(
-        lambda cap: bool(token_set & set(stem_tokenize(cap))) if pd.notna(cap) else False
-    )
+    matches = _fast_caption_match(df["caption"], tokens)
     matched = df[matches].head(limit)
 
     images = []
