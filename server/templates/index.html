@@ -138,7 +138,6 @@ h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
             <label>Mode:</label>
             <select id="mode">
                 <option value="keyword">Keyword</option>
-                <option value="semantic">Semantic</option>
             </select>
         </div>
         <div class="option-group">
@@ -387,8 +386,9 @@ async function doSearch() {
         });
 
         if (!resp.ok) {
-            const err = await resp.json();
-            throw new Error(err.detail || resp.statusText);
+            let msg = resp.statusText;
+            try { const err = await resp.json(); msg = err.detail || msg; } catch {}
+            throw new Error(msg);
         }
 
         const data = await resp.json();
@@ -475,8 +475,9 @@ async function loadGrid(query, zoom, bbox) {
         });
 
         if (!resp.ok) {
-            const err = await resp.json();
-            throw new Error(err.detail || resp.statusText);
+            let msg = resp.statusText;
+            try { const err = await resp.json(); msg = err.detail || msg; } catch {}
+            throw new Error(msg);
         }
 
         const data = await resp.json();
@@ -502,8 +503,9 @@ async function loadImages(query, tileKey) {
         });
 
         if (!resp.ok) {
-            const err = await resp.json();
-            throw new Error(err.detail || resp.statusText);
+            let msg = resp.statusText;
+            try { const err = await resp.json(); msg = err.detail || msg; } catch {}
+            throw new Error(msg);
         }
 
         const data = await resp.json();
