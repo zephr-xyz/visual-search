@@ -31,6 +31,7 @@ from pathlib import Path
 import faiss
 import numpy as np
 import pandas as pd
+from scipy import sparse
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -286,7 +287,7 @@ def load_indexes():
 
 class SearchRequest(BaseModel):
     query: str
-    mode: str = "keyword"       # "keyword" or "semantic"
+    mode: str = "combined"      # "keyword", "combined", or "semantic"
     geo_level: str = "state"    # "state" or "msa"
     top_k: int = 100_000        # FAISS top-K for semantic mode
 
@@ -296,7 +297,7 @@ class SearchResult(BaseModel):
     mode: str
     geo_level: str
     elapsed_ms: float
-    results: list  # [{geo_name, prevalence, count, total_images}, ...]
+    results: list  # [{geo_name, prevalence, count, total_images, signed_chi, tfidf_score, score}, ...]
 
 
 class GridSearchRequest(BaseModel):
@@ -338,7 +339,9 @@ def index():
 def search(req: SearchRequest):
     t0 = time.time()
 
-    if req.mode == "keyword":
+    if req.mode == "combined":
+        results = combined_search(req.query, req.geo_level)
+    elif req.mode == "keyword":
         results = keyword_search(req.query, req.geo_level)
     elif req.mode == "semantic":
         results = semantic_search(req.query, req.geo_level, req.top_k)
@@ -419,41 +422,191 @@ def search_images(req: ImageSearchRequest):
 
 # ── Search implementations ───────────────────────────────────────
 
-def keyword_search(query, geo_level):
-    """Stemmed keyword prevalence search."""
-    level = geo_level
-    if level not in keyword_indexes:
-        raise HTTPException(400, f"No keyword index for level: {level}")
-
+def _compute_keyword_counts(tokens, level):
+    """Get per-geography keyword match counts and totals."""
     kw = keyword_indexes[level]
     index = kw["index"]
     geo_totals = kw["geo_totals"]
 
-    tokens = stem_tokenize(query)
-    if not tokens:
-        return []
-
-    # Sum image counts per geography across all query tokens
     geo_counts = {}
     for token in tokens:
         if token in index:
             for geo, count in index[token].items():
                 geo_counts[geo] = geo_counts.get(geo, 0) + count
 
-    # Build results with prevalence
-    results = []
-    for geo, count in geo_counts.items():
-        total = geo_totals.get(geo, 1)
-        results.append(
-            {
-                "geo_name": geo,
-                "count": count,
-                "total_images": total,
-                "prevalence": round(count / total, 6),
-            }
-        )
+    return geo_counts, geo_totals
 
-    results.sort(key=lambda r: r["prevalence"], reverse=True)
+
+def _compute_signed_chi(geo_counts, geo_totals):
+    """Compute signed chi-squared for each geography.
+
+    Measures whether a term appears more (positive) or less (negative)
+    than expected under uniform distribution across geographies.
+
+    signed_chi = sign(O - E) * (O - E)^2 / E
+
+    where O = observed count, E = expected count based on global rate.
+    """
+    total_observed = sum(geo_counts.values())
+    total_images = sum(geo_totals.values())
+
+    if total_images == 0 or total_observed == 0:
+        return {}
+
+    global_rate = total_observed / total_images
+
+    chi_scores = {}
+    for geo, total in geo_totals.items():
+        observed = geo_counts.get(geo, 0)
+        expected = global_rate * total
+
+        if expected < 0.001:
+            continue
+
+        diff = observed - expected
+        chi_val = (diff * diff) / expected
+        # Sign it: positive = over-represented, negative = under-represented
+        signed = chi_val if diff >= 0 else -chi_val
+        chi_scores[geo] = signed
+
+    return chi_scores
+
+
+def _compute_tfidf_scores(tokens, level):
+    """Score geographies by TF-IDF cosine similarity to the query.
+
+    Uses the pre-built TF-IDF vocabulary and matrix to create a sparse
+    query vector, then computes dot product against each geography row.
+    """
+    if level not in tfidf_models:
+        return {}
+
+    model = tfidf_models[level]
+    vocabulary = model["vocabulary"]
+    matrix = model["matrix"]       # sparse CSR, shape (n_geos, n_terms)
+    geo_names = model["geo_names"]
+
+    # Build sparse query vector from stemmed tokens
+    query_indices = []
+    for token in tokens:
+        if token in vocabulary:
+            query_indices.append(vocabulary[token])
+
+    if not query_indices:
+        return {}
+
+    # Create sparse query vector (1 x n_terms)
+    n_terms = matrix.shape[1]
+    data = np.ones(len(query_indices), dtype=np.float64)
+    cols = np.array(query_indices, dtype=np.int32)
+    rows = np.zeros(len(query_indices), dtype=np.int32)
+    query_vec = sparse.csr_matrix((data, (rows, cols)), shape=(1, n_terms))
+
+    # L2 normalize query
+    q_norm = sparse.linalg.norm(query_vec)
+    if q_norm > 0:
+        query_vec = query_vec / q_norm
+
+    # Cosine similarity = dot product (both matrix rows and query are L2 normalized)
+    similarities = (matrix @ query_vec.T).toarray().flatten()
+
+    return {geo_names[i]: float(similarities[i]) for i in range(len(geo_names))}
+
+
+def keyword_search(query, geo_level):
+    """Stemmed keyword prevalence search with signed chi-squared."""
+    if geo_level not in keyword_indexes:
+        raise HTTPException(400, f"No keyword index for level: {geo_level}")
+
+    tokens = stem_tokenize(query)
+    if not tokens:
+        return []
+
+    geo_counts, geo_totals = _compute_keyword_counts(tokens, geo_level)
+    chi_scores = _compute_signed_chi(geo_counts, geo_totals)
+
+    results = []
+    for geo, total in geo_totals.items():
+        count = geo_counts.get(geo, 0)
+        if count == 0 and geo not in chi_scores:
+            continue
+        results.append({
+            "geo_name": geo,
+            "count": count,
+            "total_images": total,
+            "prevalence": round(count / total, 6) if total > 0 else 0,
+            "signed_chi": round(chi_scores.get(geo, 0), 2),
+            "tfidf_score": 0,
+            "score": round(chi_scores.get(geo, 0), 2),
+        })
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results
+
+
+def combined_search(query, geo_level):
+    """Combined keyword + TF-IDF search with signed chi-squared ranking.
+
+    Scoring formula:
+      score = signed_chi_norm * 0.7 + tfidf_score_norm * 0.3
+
+    The signed chi-squared captures statistical over/under-representation
+    (penalizing small samples), while TF-IDF captures softer topical
+    relevance (bigrams, partial matches) that exact stemming misses.
+    """
+    if geo_level not in keyword_indexes:
+        raise HTTPException(400, f"No keyword index for level: {geo_level}")
+
+    tokens = stem_tokenize(query)
+    if not tokens:
+        return []
+
+    geo_counts, geo_totals = _compute_keyword_counts(tokens, geo_level)
+    chi_scores = _compute_signed_chi(geo_counts, geo_totals)
+    tfidf_scores = _compute_tfidf_scores(tokens, geo_level)
+
+    # Collect all geographies that have any signal
+    all_geos = set(geo_counts.keys()) | set(tfidf_scores.keys())
+    if not all_geos:
+        return []
+
+    # Normalize signed chi scores to [-1, 1] range for blending
+    chi_vals = [chi_scores.get(g, 0) for g in all_geos]
+    chi_abs_max = max(abs(v) for v in chi_vals) if chi_vals else 1.0
+    if chi_abs_max == 0:
+        chi_abs_max = 1.0
+
+    # TF-IDF scores are already [0, 1] from cosine similarity
+    tfidf_max = max(tfidf_scores.values()) if tfidf_scores else 1.0
+    if tfidf_max == 0:
+        tfidf_max = 1.0
+
+    CHI_WEIGHT = 0.7
+    TFIDF_WEIGHT = 0.3
+
+    results = []
+    for geo in all_geos:
+        total = geo_totals.get(geo, 0)
+        count = geo_counts.get(geo, 0)
+        chi = chi_scores.get(geo, 0)
+        tfidf = tfidf_scores.get(geo, 0)
+
+        chi_norm = chi / chi_abs_max       # [-1, 1]
+        tfidf_norm = tfidf / tfidf_max     # [0, 1]
+
+        score = CHI_WEIGHT * chi_norm + TFIDF_WEIGHT * tfidf_norm
+
+        results.append({
+            "geo_name": geo,
+            "count": count,
+            "total_images": total,
+            "prevalence": round(count / total, 6) if total > 0 else 0,
+            "signed_chi": round(chi, 2),
+            "tfidf_score": round(tfidf, 4),
+            "score": round(score, 4),
+        })
+
+    results.sort(key=lambda r: r["score"], reverse=True)
     return results
 
 
