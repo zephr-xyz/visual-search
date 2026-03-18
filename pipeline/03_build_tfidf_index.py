@@ -339,16 +339,16 @@ def main():
 
         kw_index, geo_totals = build_keyword_index_chunked(geo_path, geo_col)
 
-        # Build TF-IDF matrix directly from keyword index (no re-scan needed)
-        vocabulary, tfidf_matrix, geo_names = build_tfidf_from_keyword_index(
-            kw_index, geo_totals
-        )
-
-        # Save keyword index
+        # Save keyword index immediately (before TF-IDF, so it persists on crash)
         kw_path = DATA_DIR / f"keyword_index_{level_name}.pkl"
         with open(kw_path, "wb") as f:
             pickle.dump({"index": kw_index, "geo_totals": geo_totals}, f)
         print(f"  Saved keyword index: {kw_path}")
+
+        # Build TF-IDF matrix directly from keyword index (no re-scan needed)
+        vocabulary, tfidf_matrix, geo_names = build_tfidf_from_keyword_index(
+            kw_index, geo_totals
+        )
 
         # Save TF-IDF model (vocabulary dict instead of vectorizer for query-time)
         tfidf_path = DATA_DIR / f"tfidf_model_{level_name}.pkl"
