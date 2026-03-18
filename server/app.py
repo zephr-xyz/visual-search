@@ -122,15 +122,40 @@ def tiles_in_bbox(west, south, east, north, zoom):
     return tiles
 
 
+_tile_cache = {}  # z10_key -> DataFrame (cached for fast drill-down)
+_tile_cache_max = 20  # Keep up to 20 z10 tiles in memory (~200MB)
+
+
 def load_tile_partition(z10_key, columns=None):
-    """Load a caption partition file for a z10 tile. Returns DataFrame or None."""
+    """Load a caption partition file for a z10 tile with LRU caching."""
     if caption_tile_dir is None:
         return None
+
+    # Check cache (full DataFrame, then filter columns if needed)
+    if z10_key in _tile_cache:
+        df = _tile_cache[z10_key]
+        if columns:
+            available = [c for c in columns if c in df.columns]
+            return df[available].copy()
+        return df
+
     safe_name = z10_key.replace("/", "_")
     path = caption_tile_dir / f"{safe_name}.parquet"
-    if path.exists():
-        return pd.read_parquet(path, columns=columns)
-    return None
+    if not path.exists():
+        return None
+
+    df = pd.read_parquet(path)
+
+    # Evict oldest if cache is full
+    if len(_tile_cache) >= _tile_cache_max:
+        oldest = next(iter(_tile_cache))
+        del _tile_cache[oldest]
+    _tile_cache[z10_key] = df
+
+    if columns:
+        available = [c for c in columns if c in df.columns]
+        return df[available].copy()
+    return df
 
 
 # ── Embedding model (lazy-loaded for semantic search) ────────────
