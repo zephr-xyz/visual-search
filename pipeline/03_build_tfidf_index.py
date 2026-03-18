@@ -105,42 +105,54 @@ def _tokenize_chunk(args):
     return dict(local_index), dict(local_totals)
 
 
-def build_keyword_index(df, geo_col, n_workers=None):
+def build_keyword_index_chunked(geo_path, geo_col, batch_size=500_000, n_workers=None):
     """Build inverted index: stemmed_term -> {geography: image_count}.
 
-    Uses multiprocessing to parallelize stemming across CPU cores.
-    Also returns per-geography total image counts.
+    Reads data in chunks via PyArrow to avoid loading all 14M captions at once.
+    Each chunk is processed with multiprocessing, then results are merged.
     """
     if n_workers is None:
         n_workers = min(mp.cpu_count(), 8)
 
+    import pyarrow.parquet as pq
+
     print(f"  Building keyword index for {geo_col} ({n_workers} workers)...")
     t0 = time.time()
 
-    # Prepare data as lists
-    geos = df[geo_col].tolist()
-    captions = df["caption"].tolist()
-    n = len(geos)
-
-    # Split into chunks for parallel processing
-    chunk_size = max(1, n // n_workers)
-    chunks = []
-    for i in range(0, n, chunk_size):
-        chunks.append((geos[i:i + chunk_size], captions[i:i + chunk_size]))
-
-    # Process in parallel
-    with mp.Pool(n_workers) as pool:
-        results = pool.map(_tokenize_chunk, chunks)
-
-    # Merge results
     index = defaultdict(lambda: defaultdict(int))
     geo_totals = defaultdict(int)
-    for chunk_index, chunk_totals in results:
-        for term, geo_counts in chunk_index.items():
-            for geo, count in geo_counts.items():
-                index[term][geo] += count
-        for geo, count in chunk_totals.items():
-            geo_totals[geo] += count
+    total_rows = 0
+
+    pf = pq.ParquetFile(geo_path)
+    for batch_i, batch in enumerate(pf.iter_batches(batch_size=batch_size, columns=[geo_col, "caption"])):
+        df_chunk = batch.to_pandas()
+        geos = df_chunk[geo_col].tolist()
+        captions = df_chunk["caption"].tolist()
+        n = len(geos)
+        total_rows += n
+        del df_chunk
+
+        # Split into sub-chunks for parallel processing
+        sub_size = max(1, n // n_workers)
+        chunks = []
+        for i in range(0, n, sub_size):
+            chunks.append((geos[i:i + sub_size], captions[i:i + sub_size]))
+        del geos, captions
+
+        with mp.Pool(n_workers) as pool:
+            results = pool.map(_tokenize_chunk, chunks)
+        del chunks
+
+        for chunk_index, chunk_totals in results:
+            for term, geo_counts in chunk_index.items():
+                for geo, count in geo_counts.items():
+                    index[term][geo] += count
+            for geo, count in chunk_totals.items():
+                geo_totals[geo] += count
+        del results
+
+        if (batch_i + 1) % 5 == 0:
+            print(f"    batch {batch_i+1}: {total_rows:,} rows processed", flush=True)
 
     index = {term: dict(geos) for term, geos in index.items()}
     geo_totals = dict(geo_totals)
@@ -155,38 +167,62 @@ def _stem_doc(text):
     return " ".join(stem_tokenize(text))
 
 
-def build_tfidf_matrix(df, geo_col, n_workers=None):
+def build_tfidf_matrix_chunked(geo_path, geo_col, batch_size=500_000, n_workers=None):
     """Build TF-IDF matrix where each row is a geography.
 
-    Concatenates all captions in each geography into one document,
-    then fits a TfidfVectorizer with stemming and bigrams.
+    Reads data in chunks to build per-geography stemmed token lists,
+    then fits a TfidfVectorizer.
     """
     if n_workers is None:
         n_workers = min(mp.cpu_count(), 8)
 
+    import pyarrow.parquet as pq
+
     print(f"  Building TF-IDF matrix for {geo_col} ({n_workers} workers)...")
     t0 = time.time()
 
-    # Concatenate captions per geography
-    geo_docs = {}
-    for geo_name, caption in zip(df[geo_col], df["caption"]):
-        if pd.isna(geo_name) or not caption:
-            continue
-        if geo_name not in geo_docs:
-            geo_docs[geo_name] = []
-        geo_docs[geo_name].append(caption)
+    # Phase 1: Collect stemmed tokens per geography in chunks
+    # Store as pre-stemmed token strings to avoid holding raw captions
+    geo_tokens = defaultdict(list)  # geo -> list of stemmed token strings
 
-    geo_names = sorted(geo_docs.keys())
-    raw_docs = [" ".join(geo_docs[g]) for g in geo_names]
+    pf = pq.ParquetFile(geo_path)
+    total_rows = 0
+    for batch_i, batch in enumerate(pf.iter_batches(batch_size=batch_size, columns=[geo_col, "caption"])):
+        df_chunk = batch.to_pandas()
+        total_rows += len(df_chunk)
 
-    # Pre-stem documents in parallel
-    print(f"    Pre-stemming {len(geo_names)} documents...", flush=True)
-    with mp.Pool(n_workers) as pool:
-        documents = pool.map(_stem_doc, raw_docs)
-    del raw_docs
+        # Group captions by geo within this chunk
+        chunk_geo_captions = defaultdict(list)
+        for geo_name, caption in zip(df_chunk[geo_col], df_chunk["caption"]):
+            if pd.isna(geo_name) or not caption:
+                continue
+            chunk_geo_captions[geo_name].append(caption)
+        del df_chunk
 
+        # Stem concatenated captions per geo in this chunk using multiprocessing
+        geo_names_chunk = list(chunk_geo_captions.keys())
+        raw_docs_chunk = [" ".join(chunk_geo_captions[g]) for g in geo_names_chunk]
+        del chunk_geo_captions
+
+        with mp.Pool(n_workers) as pool:
+            stemmed_chunk = pool.map(_stem_doc, raw_docs_chunk)
+        del raw_docs_chunk
+
+        for geo_name, stemmed in zip(geo_names_chunk, stemmed_chunk):
+            geo_tokens[geo_name].append(stemmed)
+        del stemmed_chunk, geo_names_chunk
+
+        if (batch_i + 1) % 5 == 0:
+            print(f"    batch {batch_i+1}: {total_rows:,} rows, {len(geo_tokens)} geos", flush=True)
+
+    # Phase 2: Build final documents and fit TF-IDF
+    geo_names = sorted(geo_tokens.keys())
+    documents = [" ".join(geo_tokens[g]) for g in geo_names]
+    del geo_tokens
+
+    print(f"    Fitting TF-IDF on {len(geo_names)} geographies...", flush=True)
     vectorizer = TfidfVectorizer(
-        token_pattern=r"[a-z]{2,}",  # match pre-stemmed tokens
+        token_pattern=r"[a-z]{2,}",
         ngram_range=(1, 2),
         min_df=2,
         max_df=0.85,
@@ -194,6 +230,7 @@ def build_tfidf_matrix(df, geo_col, n_workers=None):
         sublinear_tf=True,
     )
     tfidf_matrix = vectorizer.fit_transform(documents)
+    del documents
 
     elapsed = time.time() - t0
     vocab_size = len(vectorizer.vocabulary_)
@@ -204,35 +241,48 @@ def build_tfidf_matrix(df, geo_col, n_workers=None):
     return vectorizer, tfidf_matrix, geo_names
 
 
-def build_caption_partitions(df, partition_col, output_dir):
+def build_caption_partitions_chunked(geo_path, partition_col, output_dir, batch_size=500_000):
     """Partition image captions by tile key for on-demand z12/z14 queries.
 
-    Each partition file contains image_id, lat, lng, caption, sequence_id,
-    and finer-grained tile keys (z12_tile, z14_tile).
+    Reads data in chunks to avoid loading all 14M rows at once.
+    Accumulates per-tile DataFrames and writes them at the end.
     """
+    import pyarrow.parquet as pq
+
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"  Building caption partitions by {partition_col}...")
     t0 = time.time()
 
-    cols = ["image_id", "sequence_id", "lat", "lng", "caption",
-            "z12_tile", "z14_tile"]
-    # Only keep columns that exist
-    cols = [c for c in cols if c in df.columns]
-    cols.append(partition_col)
+    desired_cols = ["image_id", "sequence_id", "lat", "lng", "caption",
+                    "z12_tile", "z14_tile", partition_col]
+    available_cols = pq.read_schema(geo_path).names
+    load_cols = [c for c in desired_cols if c in available_cols]
 
-    subset = df[cols].dropna(subset=[partition_col, "caption"])
+    # Accumulate rows per tile
+    tile_rows = defaultdict(list)
+    total_rows = 0
+
+    pf = pq.ParquetFile(geo_path)
+    for batch in pf.iter_batches(batch_size=batch_size, columns=load_cols):
+        df_chunk = batch.to_pandas()
+        df_chunk = df_chunk.dropna(subset=[partition_col, "caption"])
+        total_rows += len(df_chunk)
+
+        for tile_key, group in df_chunk.groupby(partition_col):
+            tile_rows[tile_key].append(group.drop(columns=[partition_col]))
+        del df_chunk
+
+    # Write partition files
     n_partitions = 0
-
-    for tile_key, group in subset.groupby(partition_col):
-        # Convert tile key like "z10/512/345" to a safe filename
+    for tile_key, dfs in tile_rows.items():
         safe_name = tile_key.replace("/", "_")
-        group.drop(columns=[partition_col]).to_parquet(
-            output_dir / f"{safe_name}.parquet", index=False
-        )
+        combined = pd.concat(dfs, ignore_index=True)
+        combined.to_parquet(output_dir / f"{safe_name}.parquet", index=False)
         n_partitions += 1
+    del tile_rows
 
     elapsed = time.time() - t0
-    print(f"    {n_partitions:,} partition files ({elapsed:.1f}s)")
+    print(f"    {n_partitions:,} partition files from {total_rows:,} rows ({elapsed:.1f}s)")
     return n_partitions
 
 
@@ -255,16 +305,11 @@ def main():
         print(f"ERROR: {geo_path} not found. Run 02_geocode.py first.")
         raise SystemExit(1)
 
-    print("Loading geocoded data...")
-    needed_cols = ["image_id", "sequence_id", "lat", "lng", "caption",
-                   "state_name", "cbsa_name", "z8_tile", "z10_tile",
-                   "z12_tile", "z14_tile"]
-    # Only load columns that exist in the file
     import pyarrow.parquet as pq
-    available_cols = pq.read_schema(geo_path).names
-    load_cols = [c for c in needed_cols if c in available_cols]
-    df = pd.read_parquet(geo_path, columns=load_cols)
-    print(f"  {len(df):,} images")
+    pf = pq.ParquetFile(geo_path)
+    available_cols = pf.schema.names
+    total_rows = pf.metadata.num_rows
+    print(f"Geocoded data: {total_rows:,} images, columns: {available_cols}")
 
     results = {}
 
@@ -285,20 +330,21 @@ def main():
         levels = [(args.geo_level, all_levels[args.geo_level])]
 
     for level_name, geo_col in levels:
-        if geo_col not in df.columns:
+        if geo_col not in available_cols:
             print(f"\n=== {level_name.upper()} level === SKIPPED (column {geo_col} not found)")
             continue
 
         print(f"\n=== {level_name.upper()} level ===")
 
-        kw_index, geo_totals = build_keyword_index(df, geo_col)
-        vectorizer, tfidf_matrix, geo_names = build_tfidf_matrix(df, geo_col)
+        kw_index, geo_totals = build_keyword_index_chunked(geo_path, geo_col)
+        vectorizer, tfidf_matrix, geo_names = build_tfidf_matrix_chunked(geo_path, geo_col)
 
         # Save keyword index
         kw_path = DATA_DIR / f"keyword_index_{level_name}.pkl"
         with open(kw_path, "wb") as f:
             pickle.dump({"index": kw_index, "geo_totals": geo_totals}, f)
         print(f"  Saved keyword index: {kw_path}")
+        del kw_index
 
         # Save TF-IDF model
         tfidf_path = DATA_DIR / f"tfidf_model_{level_name}.pkl"
@@ -312,14 +358,15 @@ def main():
                 f,
             )
         print(f"  Saved TF-IDF model: {tfidf_path}")
+        del vectorizer, tfidf_matrix, geo_names
 
         results[level_name] = geo_totals
 
     # Build per-z10 caption partitions for on-demand z12/z14 queries
-    if not args.skip_partitions and "z10_tile" in df.columns:
+    if not args.skip_partitions and "z10_tile" in available_cols:
         print("\n=== Caption partitions (by z10 tile) ===")
         partition_dir = DATA_DIR / "captions_by_tile"
-        build_caption_partitions(df, "z10_tile", partition_dir)
+        build_caption_partitions_chunked(geo_path, "z10_tile", partition_dir)
 
     # Save geography stats
     stats_path = DATA_DIR / "geography_stats.json"
