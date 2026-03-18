@@ -41,7 +41,7 @@ import nltk
 import numpy as np
 import pandas as pd
 from nltk.stem.snowball import SnowballStemmer
-from sklearn.feature_extraction.text import TfidfVectorizer
+from scipy import sparse
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -167,78 +167,79 @@ def _stem_doc(text):
     return " ".join(stem_tokenize(text))
 
 
-def build_tfidf_matrix_chunked(geo_path, geo_col, batch_size=500_000, n_workers=None):
-    """Build TF-IDF matrix where each row is a geography.
+def build_tfidf_from_keyword_index(kw_index, geo_totals):
+    """Build TF-IDF matrix directly from the keyword index.
 
-    Reads data in chunks to build per-geography stemmed token lists,
-    then fits a TfidfVectorizer.
+    Instead of re-scanning all captions, reuses the keyword index which already
+    has per-term, per-geography image counts. This is memory-efficient since
+    the keyword index is much smaller than raw caption text.
+
+    Each geography becomes a row, each stemmed term becomes a column.
+    TF = count_images_with_term_in_geo / total_images_in_geo (sublinear)
+    IDF = log(total_geos / geos_containing_term) + 1
     """
-    if n_workers is None:
-        n_workers = min(mp.cpu_count(), 8)
-
-    import pyarrow.parquet as pq
-
-    print(f"  Building TF-IDF matrix for {geo_col} ({n_workers} workers)...")
+    print(f"  Building TF-IDF matrix from keyword index...")
     t0 = time.time()
 
-    # Phase 1: Collect stemmed tokens per geography in chunks
-    # Store as pre-stemmed token strings to avoid holding raw captions
-    geo_tokens = defaultdict(list)  # geo -> list of stemmed token strings
+    geo_names = sorted(geo_totals.keys())
+    geo_idx = {g: i for i, g in enumerate(geo_names)}
+    n_geos = len(geo_names)
 
-    pf = pq.ParquetFile(geo_path)
-    total_rows = 0
-    for batch_i, batch in enumerate(pf.iter_batches(batch_size=batch_size, columns=[geo_col, "caption"])):
-        df_chunk = batch.to_pandas()
-        total_rows += len(df_chunk)
+    # Filter terms: must appear in >= 2 geos and <= 85% of geos
+    min_df = 2
+    max_df = int(n_geos * 0.85)
+    terms = []
+    for term, geo_counts in kw_index.items():
+        n_geos_with_term = len(geo_counts)
+        if min_df <= n_geos_with_term <= max(max_df, min_df):
+            terms.append(term)
 
-        # Group captions by geo within this chunk
-        chunk_geo_captions = defaultdict(list)
-        for geo_name, caption in zip(df_chunk[geo_col], df_chunk["caption"]):
-            if pd.isna(geo_name) or not caption:
+    # Sort and limit to top 100K by total frequency
+    term_totals = {t: sum(kw_index[t].values()) for t in terms}
+    terms = sorted(terms, key=lambda t: term_totals[t], reverse=True)[:100_000]
+    term_idx = {t: i for i, t in enumerate(terms)}
+    n_terms = len(terms)
+
+    print(f"    {n_terms:,} terms after filtering (min_df={min_df}, max_df={max_df})")
+
+    # Build sparse TF-IDF matrix
+    rows, cols, values = [], [], []
+    for term, t_i in term_idx.items():
+        geo_counts = kw_index[term]
+        n_geos_with_term = len(geo_counts)
+        idf = np.log(n_geos / n_geos_with_term) + 1.0
+
+        for geo, count in geo_counts.items():
+            if geo not in geo_idx:
                 continue
-            chunk_geo_captions[geo_name].append(caption)
-        del df_chunk
+            g_i = geo_idx[geo]
+            total = geo_totals[geo]
+            # Sublinear TF
+            tf = 1.0 + np.log(count) if count > 0 else 0.0
+            tf_norm = tf / total if total > 0 else 0.0
+            rows.append(g_i)
+            cols.append(t_i)
+            values.append(tf_norm * idf)
 
-        # Stem concatenated captions per geo in this chunk using multiprocessing
-        geo_names_chunk = list(chunk_geo_captions.keys())
-        raw_docs_chunk = [" ".join(chunk_geo_captions[g]) for g in geo_names_chunk]
-        del chunk_geo_captions
-
-        with mp.Pool(n_workers) as pool:
-            stemmed_chunk = pool.map(_stem_doc, raw_docs_chunk)
-        del raw_docs_chunk
-
-        for geo_name, stemmed in zip(geo_names_chunk, stemmed_chunk):
-            geo_tokens[geo_name].append(stemmed)
-        del stemmed_chunk, geo_names_chunk
-
-        if (batch_i + 1) % 5 == 0:
-            print(f"    batch {batch_i+1}: {total_rows:,} rows, {len(geo_tokens)} geos", flush=True)
-
-    # Phase 2: Build final documents and fit TF-IDF
-    geo_names = sorted(geo_tokens.keys())
-    documents = [" ".join(geo_tokens[g]) for g in geo_names]
-    del geo_tokens
-
-    print(f"    Fitting TF-IDF on {len(geo_names)} geographies...", flush=True)
-    vectorizer = TfidfVectorizer(
-        token_pattern=r"[a-z]{2,}",
-        ngram_range=(1, 2),
-        min_df=2,
-        max_df=0.85,
-        max_features=100_000,
-        sublinear_tf=True,
+    tfidf_matrix = sparse.csr_matrix(
+        (values, (rows, cols)), shape=(n_geos, n_terms)
     )
-    tfidf_matrix = vectorizer.fit_transform(documents)
-    del documents
+
+    # L2 normalize rows
+    row_norms = sparse.linalg.norm(tfidf_matrix, axis=1)
+    row_norms[row_norms == 0] = 1.0
+    tfidf_matrix = tfidf_matrix.multiply(1.0 / row_norms.reshape(-1, 1))
+    tfidf_matrix = sparse.csr_matrix(tfidf_matrix)
+
+    # Build a vocabulary dict for query-time term lookup
+    vocabulary = term_idx
 
     elapsed = time.time() - t0
-    vocab_size = len(vectorizer.vocabulary_)
     print(
-        f"    Matrix: {tfidf_matrix.shape[0]} geographies x {vocab_size:,} terms "
+        f"    Matrix: {n_geos} geographies x {n_terms:,} terms "
         f"({elapsed:.1f}s)"
     )
-    return vectorizer, tfidf_matrix, geo_names
+    return vocabulary, tfidf_matrix, geo_names
 
 
 def build_caption_partitions_chunked(geo_path, partition_col, output_dir, batch_size=500_000):
@@ -337,28 +338,31 @@ def main():
         print(f"\n=== {level_name.upper()} level ===")
 
         kw_index, geo_totals = build_keyword_index_chunked(geo_path, geo_col)
-        vectorizer, tfidf_matrix, geo_names = build_tfidf_matrix_chunked(geo_path, geo_col)
+
+        # Build TF-IDF matrix directly from keyword index (no re-scan needed)
+        vocabulary, tfidf_matrix, geo_names = build_tfidf_from_keyword_index(
+            kw_index, geo_totals
+        )
 
         # Save keyword index
         kw_path = DATA_DIR / f"keyword_index_{level_name}.pkl"
         with open(kw_path, "wb") as f:
             pickle.dump({"index": kw_index, "geo_totals": geo_totals}, f)
         print(f"  Saved keyword index: {kw_path}")
-        del kw_index
 
-        # Save TF-IDF model
+        # Save TF-IDF model (vocabulary dict instead of vectorizer for query-time)
         tfidf_path = DATA_DIR / f"tfidf_model_{level_name}.pkl"
         with open(tfidf_path, "wb") as f:
             pickle.dump(
                 {
-                    "vectorizer": vectorizer,
+                    "vocabulary": vocabulary,
                     "matrix": tfidf_matrix,
                     "geo_names": geo_names,
                 },
                 f,
             )
         print(f"  Saved TF-IDF model: {tfidf_path}")
-        del vectorizer, tfidf_matrix, geo_names
+        del kw_index, vocabulary, tfidf_matrix, geo_names
 
         results[level_name] = geo_totals
 

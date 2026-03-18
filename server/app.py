@@ -45,7 +45,7 @@ app = FastAPI(title="Visual Search", version="1.0")
 # ── Global state loaded on startup ───────────────────────────────
 
 keyword_indexes = {}   # {level: {"index": {term: {geo: count}}, "geo_totals": {...}}}
-tfidf_models = {}      # {level: {"vectorizer", "matrix", "geo_names"}}
+tfidf_models = {}      # {level: {"vocabulary", "matrix", "geo_names"}}
 faiss_index = None
 faiss_geo_lookup = None  # DataFrame: position-aligned state_name, cbsa_name
 geo_stats = {}
