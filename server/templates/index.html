@@ -85,29 +85,45 @@ h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
 .result-pct { font-size: 12px; color: #666; width: 50px; text-align: right; flex-shrink: 0; }
 .result-count { font-size: 11px; color: #999; width: 50px; text-align: right; flex-shrink: 0; }
 
-/* Image results panel */
+/* Image results panel — Pinterest-style masonry gallery */
 #image-panel {
     display: none; position: absolute; top: 12px; right: 12px; z-index: 10;
-    background: white; border-radius: 8px; padding: 16px;
+    background: white; border-radius: 8px;
     box-shadow: 0 2px 12px rgba(0,0,0,0.15);
-    width: 380px; max-height: calc(100vh - 24px); overflow-y: auto;
+    width: 420px; max-height: calc(100vh - 24px); overflow-y: auto;
 }
-#image-panel h3 { font-size: 14px; margin-bottom: 8px; color: #333; }
-#image-panel .close-btn {
+#image-panel-header {
+    position: sticky; top: 0; background: white; padding: 12px 16px;
+    border-bottom: 1px solid #eee; z-index: 1;
+}
+#image-panel-header h3 { font-size: 14px; margin-bottom: 4px; color: #333; }
+#image-panel-header .close-btn {
     position: absolute; top: 10px; right: 14px;
     cursor: pointer; font-size: 18px; color: #999;
 }
-#image-panel .close-btn:hover { color: #333; }
+#image-panel-header .close-btn:hover { color: #333; }
+.masonry-grid {
+    column-count: 2; column-gap: 8px; padding: 8px;
+}
 .image-card {
-    border: 1px solid #eee; border-radius: 6px; padding: 10px;
-    margin-bottom: 8px; font-size: 12px;
+    break-inside: avoid; margin-bottom: 8px; border-radius: 8px;
+    overflow: hidden; cursor: pointer; position: relative;
+    background: #f0f0f0; transition: box-shadow 0.15s ease;
 }
-.image-card .caption { color: #333; margin-bottom: 6px; line-height: 1.4; }
-.image-card .meta { color: #888; font-size: 11px; }
-.image-card a {
-    color: #4a90d9; text-decoration: none; font-weight: 500;
+.image-card img {
+    width: 100%; display: block; border-radius: 8px;
+    min-height: 80px; object-fit: cover;
 }
-.image-card a:hover { text-decoration: underline; }
+.image-card:hover {
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+}
+.image-card.active {
+    outline: 3px solid #4a90d9;
+}
+#scroll-sentinel {
+    height: 40px; display: flex; align-items: center;
+    justify-content: center; color: #999; font-size: 12px;
+}
 
 #legend {
     position: absolute; bottom: 30px; right: 12px; z-index: 10;
@@ -155,10 +171,13 @@ h1 { font-size: 16px; margin-bottom: 12px; color: #333; }
 </div>
 
 <div id="image-panel">
-    <span class="close-btn" onclick="closeImagePanel()">&times;</span>
-    <h3 id="image-panel-title">Images</h3>
-    <div id="image-panel-status" style="font-size:12px; color:#888; margin-bottom:8px;"></div>
-    <div id="image-list"></div>
+    <div id="image-panel-header">
+        <span class="close-btn" onclick="closeImagePanel()">&times;</span>
+        <h3 id="image-panel-title">Images</h3>
+        <div id="image-panel-status" style="font-size:12px; color:#888;"></div>
+    </div>
+    <div id="image-list" class="masonry-grid"></div>
+    <div id="scroll-sentinel"></div>
 </div>
 
 <div id="legend" style="display:none;">
@@ -188,6 +207,19 @@ let msaGeojson = null;
 // Drill-down state
 let drillStack = []; // [{level, label, bbox?}]
 let gridMarkers = []; // MapLibre markers for image pins
+
+// Gallery state
+let galleryImages = [];
+let galleryOffset = 0;
+let galleryHasMore = false;
+let galleryQuery = '';
+let galleryTileKey = '';
+let galleryLoading = false;
+let galleryObserver = null;
+
+// Zoom-tracking state
+let currentDataLevel = null;  // null | 'choropleth' | 10 | 12 | 14 | 'images'
+let ignoreZoomEnd = false;    // suppress handler during programmatic zoom
 
 // ── Map initialization ──────────────────────────────────────
 
@@ -326,9 +358,8 @@ function initMap() {
         map.on('mousemove', 'image-circles', (e) => {
             map.getCanvas().style.cursor = 'pointer';
             const p = e.features[0].properties;
-            const cap = p.caption.length > 120 ? p.caption.slice(0, 120) + '...' : p.caption;
             popup.setLngLat(e.lngLat).setHTML(
-                `<strong>${p.image_id}</strong><br>${cap}`
+                `<strong>${p.image_id}</strong>`
             ).addTo(map);
         });
         map.on('mouseleave', 'image-circles', () => {
@@ -340,6 +371,14 @@ function initMap() {
         map.on('click', 'choropleth-fill', onChoroplethClick);
         map.on('click', 'grid-fill', onGridClick);
         map.on('click', 'image-circles', onImageClick);
+
+        // Zoom-based re-aggregation
+        let zoomDebounce = null;
+        map.on('zoomend', () => {
+            if (ignoreZoomEnd || !currentQuery) return;
+            clearTimeout(zoomDebounce);
+            zoomDebounce = setTimeout(onMapZoomChange, 300);
+        });
 
         loadBoundaries();
     });
@@ -396,6 +435,7 @@ async function doSearch() {
 
         const data = await resp.json();
         currentResults = data.results;
+        currentDataLevel = 'choropleth';
 
         status.textContent =
             `${data.results.length} geographies | ${data.elapsed_ms.toFixed(0)}ms | ${mode} | Click a region to drill down`;
@@ -425,7 +465,7 @@ function onChoroplethClick(e) {
     updateBreadcrumb();
 
     // Fly to the region and load z10 grid
-    map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40 });
+    programmaticZoom(() => map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40 }));
     loadGrid(currentQuery, 10, bbox);
 }
 
@@ -450,7 +490,7 @@ function onGridClick(e) {
     drillStack.push({ level: `z${currentZoom}`, label: tileKey, bbox });
     updateBreadcrumb();
 
-    map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 });
+    programmaticZoom(() => map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 20 }));
 
     if (nextZoom <= 14) {
         loadGrid(currentQuery, nextZoom, bbox);
@@ -459,7 +499,7 @@ function onGridClick(e) {
 
 function onImageClick(e) {
     const props = e.features[0].properties;
-    window.open(props.mapillary_url, '_blank');
+    window.open(`https://www.mapillary.com/app/?pKey=${props.image_id}`, '_blank');
 }
 
 // ── Grid loading ────────────────────────────────────────────
@@ -484,6 +524,7 @@ async function loadGrid(query, zoom, bbox) {
         }
 
         const data = await resp.json();
+        currentDataLevel = zoom;
         status.textContent =
             `z${zoom}: ${data.tiles.length} tiles | ${data.elapsed_ms.toFixed(0)}ms | Click a tile to zoom in`;
         renderGrid(data.tiles, zoom);
@@ -498,11 +539,18 @@ async function loadImages(query, tileKey) {
     const status = document.getElementById('status');
     status.textContent = `Loading images in ${tileKey}...`;
 
+    // Reset gallery state
+    galleryImages = [];
+    galleryOffset = 0;
+    galleryHasMore = true;
+    galleryQuery = query;
+    galleryTileKey = tileKey;
+
     try {
         const resp = await fetch('/api/search/images', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ query, tile_key: tileKey, limit: 200 }),
+            body: JSON.stringify({ query, tile_key: tileKey, limit: 40, offset: 0 }),
         });
 
         if (!resp.ok) {
@@ -512,11 +560,17 @@ async function loadImages(query, tileKey) {
         }
 
         const data = await resp.json();
-        status.textContent =
-            `${data.images.length} matching images / ${data.total_in_area.toLocaleString()} total | ${data.elapsed_ms.toFixed(0)}ms`;
+        galleryImages = data.images;
+        galleryOffset = data.images.length;
+        galleryHasMore = data.has_more;
+        currentDataLevel = 'images';
 
-        renderImageMarkers(data.images);
-        showImagePanel(data.images, data.total_in_area, tileKey);
+        status.textContent =
+            `${data.total_matches.toLocaleString()} matching images / ${data.total_in_area.toLocaleString()} total | ${data.elapsed_ms.toFixed(0)}ms`;
+
+        // Don't render bulk markers — markers shown on hover only
+        clearImages();
+        showImagePanel(data.images, data.total_matches, data.total_in_area, tileKey);
 
         drillStack.push({ level: 'images', label: tileKey });
         updateBreadcrumb();
@@ -594,7 +648,7 @@ function clickResult(index, geoLevel) {
     const bbox = getBBoxFromCoords(feature.geometry.coordinates);
     drillStack = [{ level: 'geo', label: r.geo_name, bbox }];
     updateBreadcrumb();
-    map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40 });
+    programmaticZoom(() => map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: 40 }));
     loadGrid(currentQuery, 10, bbox);
 }
 
@@ -611,7 +665,7 @@ function clickTileResult(tileKey, w, s, e, n) {
 
     drillStack.push({ level: `z${currentZoom}`, label: tileKey, bbox: [w, s, e, n] });
     updateBreadcrumb();
-    map.fitBounds([[w, s], [e, n]], { padding: 20 });
+    programmaticZoom(() => map.fitBounds([[w, s], [e, n]], { padding: 20 }));
 
     if (nextZoom <= 14) {
         loadGrid(currentQuery, nextZoom, [w, s, e, n]);
@@ -733,33 +787,25 @@ function clearGrid() {
 
 // ── Rendering: image markers ────────────────────────────────
 
-function renderImageMarkers(images) {
-    clearImages();
-    if (!images.length) return;
+function showSingleMarker(lat, lng, imageId) {
+    if (!map || !map.getSource('image-points')) return;
+    map.getSource('image-points').setData({
+        type: 'FeatureCollection',
+        features: [{
+            type: 'Feature',
+            properties: { image_id: imageId },
+            geometry: { type: 'Point', coordinates: [lng, lat] }
+        }]
+    });
+}
 
-    const features = images.map(img => ({
-        type: 'Feature',
-        properties: {
-            image_id: img.image_id,
-            caption: img.caption,
-            mapillary_url: img.mapillary_url,
-        },
-        geometry: {
-            type: 'Point',
-            coordinates: [img.lng, img.lat]
-        }
-    }));
-
-    map.getSource('image-points').setData({ type: 'FeatureCollection', features });
-
-    // Dim grid when showing images
-    map.setPaintProperty('grid-fill', 'fill-opacity', 0.2);
+function clearSingleMarker() {
+    if (!map || !map.getSource('image-points')) return;
+    map.getSource('image-points').setData({ type: 'FeatureCollection', features: [] });
 }
 
 function clearImages() {
-    if (map && map.getSource('image-points')) {
-        map.getSource('image-points').setData({ type: 'FeatureCollection', features: [] });
-    }
+    clearSingleMarker();
     if (map) {
         map.setPaintProperty('grid-fill', 'fill-opacity', 0.6);
     }
@@ -767,36 +813,91 @@ function clearImages() {
 
 // ── Image panel ─────────────────────────────────────────────
 
-function showImagePanel(images, totalInArea, tileKey) {
+function renderImageCards(images) {
+    return images.map(img => `
+        <div class="image-card" data-lat="${img.lat}" data-lng="${img.lng}" data-id="${img.image_id}" data-url="${img.mapillary_url}">
+            <img src="/api/mapillary/thumb/${img.image_id}" loading="lazy" alt="" onerror="this.style.display='none'">
+        </div>
+    `).join('');
+}
+
+function showImagePanel(images, totalMatches, totalInArea, tileKey) {
     const panel = document.getElementById('image-panel');
     const title = document.getElementById('image-panel-title');
     const statusEl = document.getElementById('image-panel-status');
     const list = document.getElementById('image-list');
+    const sentinel = document.getElementById('scroll-sentinel');
 
     title.textContent = `Images in ${tileKey}`;
-    statusEl.textContent = `${images.length} matching / ${totalInArea.toLocaleString()} total in area`;
+    statusEl.textContent = `${totalMatches.toLocaleString()} matching / ${totalInArea.toLocaleString()} total in area`;
 
-    list.innerHTML = images.slice(0, 100).map(img => {
-        const cap = img.caption.length > 200 ? img.caption.slice(0, 200) + '...' : img.caption;
-        return `
-            <div class="image-card">
-                <div class="caption">${escapeHtml(cap)}</div>
-                <div class="meta">
-                    <a href="${img.mapillary_url}" target="_blank">View on Mapillary</a>
-                    &nbsp;|&nbsp; ${img.lat}, ${img.lng}
-                </div>
-            </div>
-        `;
-    }).join('');
+    list.innerHTML = renderImageCards(images);
+    sentinel.textContent = galleryHasMore ? '' : (images.length ? 'No more images' : '');
 
     panel.style.display = 'block';
+    panel.scrollTop = 0;
+
+    // Dim grid when showing images
+    if (map) map.setPaintProperty('grid-fill', 'fill-opacity', 0.2);
+
     // Move legend to account for panel
-    document.getElementById('legend').style.right = '404px';
+    document.getElementById('legend').style.right = '434px';
+
+    // Set up infinite scroll
+    setupInfiniteScroll();
+}
+
+function setupInfiniteScroll() {
+    if (galleryObserver) galleryObserver.disconnect();
+
+    const sentinel = document.getElementById('scroll-sentinel');
+    galleryObserver = new IntersectionObserver(async (entries) => {
+        if (!entries[0].isIntersecting || !galleryHasMore || galleryLoading) return;
+
+        galleryLoading = true;
+        sentinel.textContent = 'Loading more...';
+
+        try {
+            const resp = await fetch('/api/search/images', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    query: galleryQuery,
+                    tile_key: galleryTileKey,
+                    limit: 40,
+                    offset: galleryOffset,
+                }),
+            });
+
+            if (!resp.ok) throw new Error('Failed to load more images');
+
+            const data = await resp.json();
+            galleryImages = galleryImages.concat(data.images);
+            galleryOffset += data.images.length;
+            galleryHasMore = data.has_more;
+
+            // Append new cards
+            const list = document.getElementById('image-list');
+            list.insertAdjacentHTML('beforeend', renderImageCards(data.images));
+
+            sentinel.textContent = galleryHasMore ? '' : 'No more images';
+        } catch (e) {
+            sentinel.textContent = 'Error loading images';
+            console.error(e);
+        } finally {
+            galleryLoading = false;
+        }
+    }, { root: document.getElementById('image-panel'), threshold: 0.1 });
+
+    galleryObserver.observe(sentinel);
 }
 
 function closeImagePanel() {
+    if (galleryObserver) { galleryObserver.disconnect(); galleryObserver = null; }
+    clearSingleMarker();
     document.getElementById('image-panel').style.display = 'none';
     document.getElementById('legend').style.right = '12px';
+    if (map) map.setPaintProperty('grid-fill', 'fill-opacity', 0.6);
 }
 
 // ── Breadcrumb navigation ───────────────────────────────────
@@ -841,7 +942,7 @@ function navigateTo(index) {
             document.getElementById('status').textContent =
                 `${currentResults.length} geographies | Click a region to drill down`;
         }
-        map.flyTo({ center: [-98.5, 39.8], zoom: 4 });
+        programmaticZoom(() => map.flyTo({ center: [-98.5, 39.8], zoom: 4 }));
         return;
     }
 
@@ -853,7 +954,7 @@ function navigateTo(index) {
     updateBreadcrumb();
 
     if (target.bbox) {
-        map.fitBounds([[target.bbox[0], target.bbox[1]], [target.bbox[2], target.bbox[3]]], { padding: 40 });
+        programmaticZoom(() => map.fitBounds([[target.bbox[0], target.bbox[1]], [target.bbox[2], target.bbox[3]]], { padding: 40 }));
 
         // Determine what zoom to show
         const level = target.level;
@@ -864,6 +965,75 @@ function navigateTo(index) {
             let nextZoom = z <= 8 ? 10 : z <= 10 ? 12 : 14;
             loadGrid(currentQuery, nextZoom, target.bbox);
         }
+    }
+}
+
+// ── Zoom-based re-aggregation ────────────────────────────────
+
+function programmaticZoom(fn) {
+    ignoreZoomEnd = true;
+    fn();
+    // Clear flag after animation settles
+    map.once('moveend', () => { setTimeout(() => { ignoreZoomEnd = false; }, 100); });
+}
+
+function dataLevelForMapZoom(z) {
+    if (z < 7) return 'choropleth';
+    if (z < 10) return 10;
+    if (z < 12) return 12;
+    return 14;
+}
+
+function onMapZoomChange() {
+    const mapZoom = map.getZoom();
+    const targetLevel = dataLevelForMapZoom(mapZoom);
+
+    // Only act if we need to go coarser (zoom out) or finer (zoom in)
+    if (targetLevel === currentDataLevel) return;
+
+    const bounds = map.getBounds();
+    const bbox = [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()];
+
+    if (targetLevel === 'choropleth') {
+        // Zoom out to overview
+        drillStack = [];
+        clearGrid();
+        clearImages();
+        closeImagePanel();
+        updateBreadcrumb();
+        currentDataLevel = 'choropleth';
+        const geoLevel = document.getElementById('geo-level').value;
+        if (currentResults) {
+            renderChoropleth(currentResults, geoLevel);
+            renderResults(currentResults, geoLevel);
+            document.getElementById('status').textContent =
+                `${currentResults.length} geographies | Click a region to drill down`;
+        }
+        return;
+    }
+
+    // For grid levels (10, 12, 14): load the grid for the visible bbox
+    // Trim the drill stack to match
+    if (typeof targetLevel === 'number') {
+        // Close image panel if going back to grid
+        if (currentDataLevel === 'images') {
+            closeImagePanel();
+        }
+
+        // Trim drill stack: remove entries deeper than what we're navigating to
+        // Keep geo entry + any grid entries at zoom < targetLevel
+        drillStack = drillStack.filter(d => {
+            if (d.level === 'geo') return true;
+            if (d.level === 'images') return false;
+            if (d.level.startsWith('z')) {
+                const dz = parseInt(d.level.slice(1));
+                return dz < targetLevel;
+            }
+            return true;
+        });
+        updateBreadcrumb();
+
+        loadGrid(currentQuery, targetLevel, bbox);
     }
 }
 
@@ -912,6 +1082,47 @@ function escapeHtml(text) {
     div.textContent = text;
     return div.innerHTML;
 }
+
+// ── Image card hover/click (event delegation) ──────────────
+
+(function() {
+    const list = document.getElementById('image-list');
+
+    function getCard(el) {
+        while (el && el !== list) {
+            if (el.classList.contains('image-card')) return el;
+            el = el.parentElement;
+        }
+        return null;
+    }
+
+    list.addEventListener('mouseenter', (e) => {
+        const card = getCard(e.target);
+        if (!card) return;
+        card.classList.add('active');
+        const lat = parseFloat(card.dataset.lat);
+        const lng = parseFloat(card.dataset.lng);
+        showSingleMarker(lat, lng, card.dataset.id);
+    }, true);
+
+    list.addEventListener('mouseleave', (e) => {
+        const card = getCard(e.target);
+        if (!card) return;
+        card.classList.remove('active');
+        clearSingleMarker();
+    }, true);
+
+    list.addEventListener('click', (e) => {
+        const card = getCard(e.target);
+        if (!card) return;
+        // Don't intercept link clicks
+        if (e.target.tagName === 'A') return;
+        const lat = parseFloat(card.dataset.lat);
+        const lng = parseFloat(card.dataset.lng);
+        showSingleMarker(lat, lng, card.dataset.id);
+        programmaticZoom(() => map.flyTo({ center: [lng, lat], zoom: 17 }));
+    });
+})();
 
 // ── Keyboard shortcut ───────────────────────────────────────
 
